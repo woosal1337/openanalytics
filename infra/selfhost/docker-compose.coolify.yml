@@ -106,14 +106,51 @@ x-node-healthcheck: &node-healthcheck
 # Coolify with a history of edge cases. The whole list is aliased onto the four
 # public services; Traefik takes one definition of a middleware and the repeats
 # are identical, so defining it more than once costs nothing.
+# ---------------------------------------------------------------------------
+# LOCAL CHANGE (chele.bi): Cloudflare Tunnel is the fronting proxy, not Traefik.
+#
+# Upstream assumes Traefik faces the internet. It does not here. Ports 80 and
+# 443 on this host are closed, and the only way in is:
+#
+#   visitor -> Cloudflare edge -> cloudflared -> coolify-proxy (Traefik) -> here
+#
+# That inverts two of the rules below.
+#
+# 1. `X-Real-IP` becomes a lie and must go. Traefik writes it from the TCP
+#    connection, and the connection is now cloudflared, so every visitor
+#    arrives as one container address. `client-identity.ts` reads `x-real-ip`
+#    FIRST, so left in place it wins over the true address: one rate-limit
+#    bucket for the whole internet, no country on any event, and an empty
+#    globe. Traefik sets this header at the entrypoint, before middlewares
+#    run, so a middleware can still delete it. `X-Forwarded-For` is no help
+#    either: Traefik does not trust cloudflared, so it drops the incoming
+#    chain and rewrites the header with the container address.
+#
+# 2. `CF-Connecting-IP` and `CF-IPCountry` become trustworthy and must stay.
+#    Upstream deletes them because on its topology a visitor can send them.
+#    Here the Cloudflare edge writes both from the connection it terminates
+#    and overwrites whatever the caller sent, which makes them exactly what
+#    the upstream comment asks for: headers the fronting proxy owns. They are
+#    now the only source of a real address, and `CF-IPCountry` gives a country
+#    that is more accurate than the local database.
+#
+# Everything else stays deleted. `CF-IPCity` is NOT set by Cloudflare on this
+# plan, so nothing would overwrite a forged one. `True-Client-IP` is an
+# Enterprise feature that is off here, so the same applies. The Fly and Vercel
+# headers belong to platforms this install does not sit on.
+#
+# Residual risk, stated rather than hidden: anything that reaches coolify-proxy
+# without going through Cloudflare can still choose its own `CF-Connecting-IP`.
+# On this host that means the LAN and the tailnet, because the public path has
+# no route that misses the edge.
+# ---------------------------------------------------------------------------
 x-client-identity-labels: &client-identity-labels
+  - 'traefik.http.middlewares.oa-client-identity.headers.customRequestHeaders.X-Real-IP='
   - 'traefik.http.middlewares.oa-client-identity.headers.customRequestHeaders.Fly-Client-IP='
-  - 'traefik.http.middlewares.oa-client-identity.headers.customRequestHeaders.CF-Connecting-IP='
   - 'traefik.http.middlewares.oa-client-identity.headers.customRequestHeaders.True-Client-IP='
   - 'traefik.http.middlewares.oa-client-identity.headers.customRequestHeaders.X-Vercel-IP-Country='
   - 'traefik.http.middlewares.oa-client-identity.headers.customRequestHeaders.X-Vercel-IP-City='
   - 'traefik.http.middlewares.oa-client-identity.headers.customRequestHeaders.Fly-Client-Country='
-  - 'traefik.http.middlewares.oa-client-identity.headers.customRequestHeaders.CF-IPCountry='
   - 'traefik.http.middlewares.oa-client-identity.headers.customRequestHeaders.CF-IPCity='
   - 'coolify.traefik.middlewares=oa-client-identity'
 
@@ -445,10 +482,18 @@ services:
       DATABASE_URL: postgres://openanalytics:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/openanalytics
       REALTIME_CACHE_REDIS_URL: redis://:${SERVICE_PASSWORD_VALKEYREALTIME}@valkey-realtime:6379
       QUERY_GATEWAY_URL: http://gateway:8081
-      AUTH_BASE_URL: ${SERVICE_URL_API}
-      APP_BASE_URL: ${SERVICE_URL_WEB}
-      COLLECTOR_BASE_URL: ${SERVICE_URL_COLLECTOR}
-      AUTH_TRUSTED_ORIGINS: ${SERVICE_URL_WEB}
+      # LOCAL CHANGE (chele.bi): the public origin is not the origin Coolify
+      # routes. TLS stops at the Cloudflare edge and the tunnel speaks plain
+      # HTTP to Traefik, so every Coolify domain here is `http://` and
+      # `SERVICE_URL_*` would hand the browser `http://oa-api.chele.bi`: a
+      # trusted-origin that never matches the `https://` page that calls it,
+      # and mixed content the browser blocks outright. These four say what the
+      # visitor sees. Set them in the Coolify environment; see SELF-HOSTING
+      # notes in the deploy task.
+      AUTH_BASE_URL: ${OA_PUBLIC_API_URL}
+      APP_BASE_URL: ${OA_PUBLIC_WEB_URL}
+      COLLECTOR_BASE_URL: ${OA_PUBLIC_COLLECTOR_URL}
+      AUTH_TRUSTED_ORIGINS: ${OA_PUBLIC_WEB_URL}
       PRODUCT_NAME: Open Analytics
       AUTH_SECRET: ${SERVICE_BASE64_64_AUTHSECRET}
       TRIAL_IDENTITY_SECRET: ${SERVICE_BASE64_64_TRIALIDENTITY}
@@ -634,9 +679,13 @@ services:
       NODE_ENV: production
       PORT: 3000
       SERVICE_FQDN_WEB_3000: /
-      NEXT_PUBLIC_API_URL: ${SERVICE_URL_API}
-      NEXT_PUBLIC_REALTIME_URL: ${SERVICE_URL_REALTIME}
-      NEXT_PUBLIC_COLLECTOR_URL: ${SERVICE_URL_COLLECTOR}
+      # LOCAL CHANGE (chele.bi): same reason as the api block above. The
+      # entrypoint substitutes these into the stashed bundle on every start, so
+      # a pulled image takes them; the warning above about building applies to
+      # the placeholder origins, not to these values.
+      NEXT_PUBLIC_API_URL: ${OA_PUBLIC_API_URL}
+      NEXT_PUBLIC_REALTIME_URL: ${OA_PUBLIC_REALTIME_URL}
+      NEXT_PUBLIC_COLLECTOR_URL: ${OA_PUBLIC_COLLECTOR_URL}
     # Traefik picks a container's port from the ports it exposes, and the six
     # backend services share a Dockerfile that declares none. Without this the
     # proxy has nowhere to send the request, so the router is dropped and its
