@@ -1,9 +1,9 @@
 "use client";
 
 import {
+  AiChat02Icon,
   ArrowDown01Icon,
   BrowserIcon as BrowserCardIcon,
-  ComputerIcon,
   File01Icon,
   Globe02Icon,
   Location01Icon,
@@ -13,14 +13,20 @@ import { AnimatePresence, motion } from "motion/react";
 import Link from "next/link";
 import * as React from "react";
 import {
+  AI_REFERRALS_CAVEAT,
+  aiTotals,
+  foldAiReferrals,
+} from "@/components/dashboard/ai-referrals-card";
+import {
   BreakdownRow,
+  breakdownShare,
 } from "@/components/dashboard/analytics-card";
 import {
   DEVICE_LABEL,
   familyLabel,
   fold,
   titleCase,
-} from "@/components/dashboard/device-cards";
+} from "@/components/dashboard/tech-card";
 import { HoverList } from "@/components/dashboard/hover-list";
 import {
   OverviewChart,
@@ -36,14 +42,16 @@ import {
   useAnalyticsInterval,
 } from "@/components/dashboard/interval-context";
 import { IntervalSelect } from "@/components/dashboard/interval-select";
-import { TimezoneSelect } from "@/components/ui/timezone-select";
+import { TimezonePill } from "@/components/dashboard/timezone-pill";
 import {
   AVG_VISIT_INFO,
   BOUNCE_INFO,
   durationLabel,
+  InfoTip,
   StatCard,
   type Stat,
 } from "@/components/dashboard/overview-stats";
+import { LiveBadge } from "@/components/dashboard/realtime-card";
 import { Favicon } from "@/components/dashboard/site-favicon";
 import {
   BrowserIcon,
@@ -76,7 +84,7 @@ import {
   type PublicOverviewResponse,
   type PublicSessionsResponse,
 } from "@/lib/api";
-import { browserTimezone } from "@/lib/timezone";
+import { resolveViewingTimezone } from "@/lib/timezone";
 import {
   MOCK_DEVICES,
   MOCK_PAGES,
@@ -179,8 +187,14 @@ export function ShareBoard({ slug }: { slug: string }) {
     },
     [slug]
   );
-  const siteZone = identity.data?.reporting_timezone ?? null;
-  const timezone = chosenZone ?? storedZone ?? siteZone ?? browserTimezone();
+  // The dashboard's rule, from the one place that holds it (ADR-0079 D5).
+  // There is no `preference` step here and there never can be: the viewer is
+  // anonymous, so the chain runs out at their browser.
+  const timezone = resolveViewingTimezone({
+    chosen: chosenZone,
+    remembered: storedZone,
+    site: identity.data?.reporting_timezone ?? null,
+  });
 
   return (
     // The dashboard's own interval machinery, with two changes for a surface
@@ -207,47 +221,6 @@ export function ShareBoard({ slug }: { slug: string }) {
         timezone={timezone}
       />
     </IntervalProvider>
-  );
-}
-
-/**
- * The board's clock, worn in the header beside the site's name: the zone
- * every window on the page is cut in, so a reader anywhere picks their own.
- *
- * The shared `TimezoneSelect` in its header dress — country-aware search
- * included, so "US" or "Türkiye" finds a clock without IANA spelling.
- *
- * Rendered only after hydration: its value defaults through the viewer's
- * browser zone, which the server cannot know — a server-rendered value
- * would be the host's clock and a hydration mismatch.
- */
-function HeaderZoneSelect({
-  value,
-  onPick,
-}: {
-  value: string;
-  onPick: (zone: string) => void;
-}) {
-  const hydrated = React.useSyncExternalStore(
-    zoneSubscribe,
-    () => true,
-    () => false
-  );
-  if (!hydrated) return null;
-
-  return (
-    <div className="hidden min-w-0 sm:block">
-      <TimezoneSelect
-        ariaLabel="Timezone the dashboard reports in"
-        onPick={(zone) => {
-          // No `nullLabel` is offered, so `null` cannot arrive; the guard
-          // is for the type, not a case.
-          if (zone !== null) onPick(zone);
-        }}
-        value={value}
-        variant="header"
-      />
-    </div>
   );
 }
 
@@ -334,12 +307,13 @@ function ShareScreen({
   );
   const chartFolded = chartFoldedFor === chartKey;
   const loadChart = React.useCallback(async () => {
-    const wholeHourZone = new Date().getTimezoneOffset() % 60 === 0;
+    // The grain is named for every zone now: since ADR-0079 step 3 the reads
+    // compose from a fifteen-minute atom, so an hour or a day is servable at
+    // +05:30 exactly as it is at +01:00. This used to withhold `resolution`
+    // for the offsets the server would have refused.
     const search = new URLSearchParams(query);
-    if (wholeHourZone) {
-      const spanMs = Date.parse(range.to) - Date.parse(range.from);
-      search.set("resolution", resolutionForInterval(interval, spanMs));
-    }
+    const spanMs = Date.parse(range.to) - Date.parse(range.from);
+    search.set("resolution", resolutionForInterval(interval, spanMs));
     try {
       const response = await publicShare.timeseries(slug, search.toString());
       setChartFoldedFor(null);
@@ -396,7 +370,7 @@ function ShareScreen({
                 reporting zone when configured, else the viewer's own — and
                 a full IANA list, so a reader anywhere views the numbers in
                 their own time. */}
-            <HeaderZoneSelect onPick={onPickZone} value={timezone} />
+            <TimezonePill onPick={onPickZone} value={timezone} />
           </span>
           <span className="flex items-center gap-3">
             <span className="hidden text-sm text-muted-foreground sm:inline">
@@ -432,21 +406,14 @@ function ShareScreen({
                   invited it to be read as a seventh breakdown. Beside the
                   title it reads as the state of the site, which is what it is.
                   Absent when realtime was not shared, exactly as before. */}
-              <h1 className="flex items-baseline gap-3 text-xl font-medium tracking-tight">
-                Overview
+              {/* The dashboard's own badge (`OverviewLiveBadge` wears the
+                  same one), so the two headings read alike to the pixel. */}
+              <div className="flex items-baseline gap-2.5">
+                <h1 className="text-xl font-medium tracking-tight">Overview</h1>
                 {liveCount !== null ? (
-                  <span className="flex items-center gap-1.5 text-sm font-normal text-muted-foreground">
-                    <span
-                      aria-hidden="true"
-                      className="size-2 animate-pulse rounded-full bg-success"
-                    />
-                    <span className="tabular-nums">
-                      {liveCount.toLocaleString("en-US")}
-                    </span>
-                    online
-                  </span>
+                  <LiveBadge className="text-base" count={liveCount} />
                 ) : null}
-              </h1>
+              </div>
               <IntervalSelect />
             </div>
 
@@ -497,15 +464,15 @@ function ShareScreen({
               {sources.phase === "ready" && sources.data === null ? null : (
                 <PublicSourcesCard sources={sources.data} />
               )}
-              {devices.phase === "ready" && devices.data === null
-                ? null
-                : DEVICE_CUTS.map((cut) => (
-                    <PublicDeviceCutCard
-                      cut={cut}
-                      devices={devices.data}
-                      key={cut.id}
-                    />
-                  ))}
+              {sources.phase === "ready" && sources.data === null ? null : (
+                <PublicAiReferralsCard sources={sources.data} />
+              )}
+              {devices.phase === "ready" && devices.data === null ? null : (
+                <>
+                  <PublicTechCard devices={devices.data} />
+                  <PublicDevicesCard devices={devices.data} />
+                </>
+              )}
             </div>
           </div>
         )}
@@ -645,11 +612,15 @@ function PublicStats({
 function PublicBreakdownCard({
   icon,
   title,
+  titleAside,
   rows,
   empty,
+  truncated = false,
 }: {
   icon: React.ReactNode;
-  title: string;
+  title: React.ReactNode;
+  /** Beside the title, outside the heading: the AI card's share and tip. */
+  titleAside?: React.ReactNode;
   rows: Array<{
     key: string;
     name: string;
@@ -657,11 +628,24 @@ function PublicBreakdownCard({
     icon?: React.ReactNode;
   }> | null;
   empty: string;
+  /** The response's own `meta.truncated`: a share of a capped row set is
+   *  inflated, so the rows render without percentages at all. */
+  truncated?: boolean;
 }) {
-  const max =
-    rows === null ? 1 : Math.max(...rows.map((row) => row.value), 1);
+  // `breakdownShare`, the dashboard's own arithmetic: a share of the TOTAL,
+  // not of the biggest row. Dividing by the max made the top row always read
+  // 100% and everything under it a ratio to it, not a share of traffic.
+  const share = breakdownShare(
+    rows === null ? [] : rows.map((row) => row.value),
+    truncated
+  );
   return (
-    <SquircleCard hideSeeAll icon={icon} title={title}>
+    <SquircleCard
+      hideSeeAll
+      icon={icon}
+      title={title}
+      titleAside={titleAside}
+    >
       <SkeletonReveal
         className="h-full [&>div]:h-full"
         ready={rows !== null}
@@ -679,7 +663,7 @@ function PublicBreakdownCard({
                   icon={row.icon}
                   key={row.key}
                   name={row.name}
-                  pct={Math.round((row.value / max) * 100)}
+                  pct={share(row.value)}
                   value={row.value.toLocaleString("en-US")}
                 />
               ))}
@@ -708,6 +692,7 @@ function PublicPagesCard({ pages }: { pages: PublicPagesResponse | null }) {
       icon={<File01Icon aria-hidden="true" />}
       rows={rows}
       title="Top pages"
+      truncated={pages?.meta.truncated ?? false}
     />
   );
 }
@@ -735,80 +720,226 @@ function PublicSourcesCard({
       icon={<Globe02Icon aria-hidden="true" />}
       rows={rows}
       title="Sources"
+      truncated={sources?.meta.truncated ?? false}
     />
   );
 }
 
 /**
- * Three cuts of one read, as three cards.
- *
- * `GET /devices` returns the device_type × browser × os combination, so all
- * three are foldings of the same response and fetching thrice would be the
- * same bytes thrice. They are separate cards rather than one card with a
- * dropdown because a public board is read, not operated: a visitor should not
- * have to discover that two more breakdowns are hiding behind a control.
+ * The visits AI assistants sent, cut from the same public sources read the
+ * Sources card folds, with the dashboard's own `foldAiReferrals`, so the two
+ * boards can never disagree about what an assistant is. The share of all
+ * visitors rides beside the title with the dashboard's caveat; there is no
+ * See all here, so the total has no header to live in and is not shown.
+ */
+function PublicAiReferralsCard({
+  sources,
+}: {
+  sources: PublicSourcesResponse | null;
+}) {
+  const rows =
+    sources === null
+      ? null
+      : foldAiReferrals(sources.items).map((row) => ({
+          key: row.label,
+          name: row.label,
+          value: row.visitors,
+          icon: sourceMark(row),
+        }));
+  const pct =
+    sources === null
+      ? null
+      : aiTotals(sources.items, sources.meta.truncated).pct;
+  return (
+    <PublicBreakdownCard
+      empty="No visits from AI assistants in this range."
+      icon={<AiChat02Icon aria-hidden="true" />}
+      rows={rows}
+      title={
+        <span className="flex min-w-0 items-baseline gap-2">
+          AI referrals
+          {pct !== null ? (
+            <span className="text-xs font-normal tabular-nums text-muted-foreground">
+              {pct}% of all visitors
+            </span>
+          ) : null}
+        </span>
+      }
+      titleAside={<InfoTip text={AI_REFERRALS_CAVEAT} width="w-72" />}
+      truncated={sources?.meta.truncated ?? false}
+    />
+  );
+}
+
+/**
+ * Browsers and operating systems in one card with the cut picker in its
+ * header, and device types as a card of their own: three cuts of one read,
+ * `GET /devices` returning the device_type × browser × os combination, so
+ * every cut is a folding of the same response. The dashboard folds all
+ * three into one card since 2026-09-10; this board keeps Devices separate
+ * because with AI referrals beside Sources its grid holds six cards, and a
+ * seventh slot standing empty read as a missing card (Abbas, 2026-09-10).
+ * The locations card already asks a visitor to pick a cut, so the picker
+ * here hides nothing new.
  *
  * Folding is on the raw token and the label is applied at render. Folding on
- * the label would hand the icons "Other" and "macOS" — neither of which any
- * glyph map knows — and every row would fall back to the generic mark.
+ * the label would hand the icons "Other" and "macOS", which no glyph map
+ * knows, and every row would fall back to the generic mark.
  */
-const DEVICE_CUTS = [
-  {
-    id: "devices",
-    title: "Devices",
-    empty: "No devices in this range.",
-    keyOf: (row: DeviceRow) => row.device_type,
-    label: (token: string) => DEVICE_LABEL[token] ?? titleCase(token),
-    mark: (token: string) => <DeviceGlyph className="size-4" deviceType={token} />,
-  },
+type TechView = "browsers" | "os";
+
+const TECH_CUTS: {
+  id: TechView;
+  label: string;
+  empty: string;
+  keyOf: (row: DeviceRow) => string;
+  name: (token: string) => string;
+  mark: (token: string) => React.ReactNode;
+}[] = [
   {
     id: "browsers",
-    title: "Browsers",
+    label: "Browsers",
     empty: "No browsers in this range.",
-    keyOf: (row: DeviceRow) => row.browser,
-    label: titleCase,
-    mark: (token: string) => <BrowserIcon className="size-4" family={token} />,
+    keyOf: (row) => row.browser,
+    name: familyLabel,
+    mark: (token) => <BrowserIcon className="size-4" family={token} />,
   },
   {
     id: "os",
-    title: "Operating systems",
+    label: "OS",
     empty: "No systems in this range.",
-    keyOf: (row: DeviceRow) => row.os,
-    label: familyLabel,
-    mark: (token: string) => <OSIcon className="size-4" family={token} />,
+    keyOf: (row) => row.os,
+    name: familyLabel,
+    mark: (token) => <OSIcon className="size-4" family={token} />,
   },
-] as const;
+];
 
-const CUT_ICON = {
-  devices: SmartPhone01Icon,
-  browsers: BrowserCardIcon,
-  os: ComputerIcon,
-} as const;
-
-function PublicDeviceCutCard({
-  cut,
+function PublicDevicesCard({
   devices,
 }: {
-  cut: (typeof DEVICE_CUTS)[number];
   devices: PublicDevicesResponse | null;
 }) {
-  const Icon = CUT_ICON[cut.id];
   const rows =
     devices === null
       ? null
-      : fold(devices.items, cut.keyOf).map((row) => ({
+      : fold(devices.items, (row) => row.device_type).map((row) => ({
           key: row.label,
-          name: cut.label(row.label),
+          name: DEVICE_LABEL[row.label] ?? titleCase(row.label),
           value: row.visitors,
-          icon: cut.mark(row.label),
+          icon: <DeviceGlyph className="size-4" deviceType={row.label} />,
         }));
   return (
     <PublicBreakdownCard
-      empty={cut.empty}
-      icon={<Icon aria-hidden="true" />}
+      empty="No devices in this range."
+      icon={<SmartPhone01Icon aria-hidden="true" />}
       rows={rows}
-      title={cut.title}
+      title="Devices"
+      truncated={devices?.meta.truncated ?? false}
     />
+  );
+}
+
+function PublicTechCard({
+  devices,
+}: {
+  devices: PublicDevicesResponse | null;
+}) {
+  const [view, setView] = React.useState<TechView>("browsers");
+  const current = TECH_CUTS.find((cut) => cut.id === view) ?? TECH_CUTS[0];
+  // "unknown" and "" collapse to one bucket first, as on the dashboard.
+  const rows =
+    devices === null
+      ? null
+      : fold(devices.items, (row) => {
+          const value = current.keyOf(row);
+          return value === "unknown" || value === "" ? "unknown" : value;
+        });
+  const share = breakdownShare(
+    rows === null ? [] : rows.map((row) => row.visitors),
+    devices?.meta.truncated ?? false
+  );
+
+  return (
+    <SquircleCard
+      hideSeeAll
+      icon={<BrowserCardIcon aria-hidden="true" />}
+      title={
+        <DropdownMenu
+          align="start"
+          className="w-36"
+          trigger={
+            <button
+              className="flex cursor-pointer items-center gap-1 rounded-lg py-0.5 outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+              type="button"
+            >
+              {/* the house label swap: the title glides when the cut changes */}
+              <AnimatePresence initial={false} mode="popLayout">
+                <motion.span
+                  animate={{ y: 0, opacity: 1 }}
+                  exit={{ y: -9, opacity: 0, transition: { duration: 0.1 } }}
+                  initial={{ y: 9, opacity: 0 }}
+                  key={current.id}
+                  transition={SPRING}
+                >
+                  {current.label}
+                </motion.span>
+              </AnimatePresence>
+              <ArrowDown01Icon
+                aria-hidden="true"
+                className="!size-3.5 text-muted-foreground/70"
+              />
+            </button>
+          }
+        >
+          {TECH_CUTS.map((cut) => (
+            <DropdownMenuItem key={cut.id} onClick={() => setView(cut.id)}>
+              {cut.label}
+            </DropdownMenuItem>
+          ))}
+        </DropdownMenu>
+      }
+    >
+      <SkeletonReveal
+        className="h-full [&>div]:h-full"
+        ready={rows !== null}
+        skeleton={<RowsSkeleton />}
+      >
+        {rows === null ? null : (
+          // the dashboard card's cut change: outgoing list drifts up and
+          // out, the new one rises in; title and content move as one
+          <AnimatePresence initial={false} mode="wait">
+            <motion.div
+              animate={{ opacity: 1, y: 0 }}
+              className="h-full"
+              exit={{ opacity: 0, y: -6, transition: { duration: 0.1 } }}
+              initial={{ opacity: 0, y: 8 }}
+              key={view}
+              transition={SPRING}
+            >
+              {rows.length === 0 ? (
+                <p className="flex h-full items-center justify-center px-6 text-center text-sm text-muted-foreground">
+                  {current.empty}
+                </p>
+              ) : (
+                <SquircleCardScroll>
+                  <HoverList>
+                    {rows.map((row) => (
+                      <BreakdownRow
+                        icon={current.mark(row.label)}
+                        key={row.label}
+                        name={current.name(row.label)}
+                        pct={share(row.visitors)}
+                        value={row.visitors.toLocaleString("en-US")}
+                      />
+                    ))}
+                  </HoverList>
+                </SquircleCardScroll>
+              )}
+            </motion.div>
+          </AnimatePresence>
+        )}
+      </SkeletonReveal>
+    </SquircleCard>
   );
 }
 
@@ -919,8 +1050,12 @@ function PublicLocationsCard({
       : view === "countries"
         ? foldCountries(items)
         : foldCities(items);
-  const max =
-    places === null ? 1 : Math.max(...places.map((place) => place.visitors), 1);
+  // Share of the total, never of the biggest row (the dashboard's own
+  // `breakdownShare`, same reasoning as `PublicBreakdownCard` above).
+  const share = breakdownShare(
+    places === null ? [] : places.map((place) => place.visitors),
+    geography?.meta.truncated ?? false
+  );
 
   return (
     <SquircleCard
@@ -997,7 +1132,7 @@ function PublicLocationsCard({
                             ? countryName(place.country)
                             : place.label
                         }
-                        pct={Math.round((place.visitors / max) * 100)}
+                        pct={share(place.visitors)}
                         value={place.visitors.toLocaleString("en-US")}
                       />
                     ))}

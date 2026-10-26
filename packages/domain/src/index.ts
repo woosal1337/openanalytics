@@ -113,6 +113,7 @@ export {
   isUtcDayAligned,
   isUtcHourAligned,
   isUtcMinuteAligned,
+  isUtcQuarterAligned,
   loadAnalyticsQueryConfig,
   resolveForcedGrain,
   timezoneOffsetMinutes,
@@ -129,6 +130,7 @@ export {
   SESSION_ACTIVITY_TYPES,
   SESSION_PASSIVE_TYPES,
   SessionConfigError,
+  eventOccurredMs,
   isEngaged,
   loadSessionConfig,
   mergedActiveDurationMs,
@@ -197,6 +199,16 @@ export {
   type WidgetRange,
   type WidgetSurface,
 } from './widget.ts'
+
+export {
+  localDay,
+  localDateParts,
+  localHour,
+  localIsoWeekKey,
+  localWeekday,
+  zonedDayStart,
+  zonedWeekStart,
+} from './zoned-calendar.ts'
 
 export {
   loadWidgetReadConfig,
@@ -363,6 +375,31 @@ export {
   type ReferrerContext,
 } from './referrer.ts'
 
+export { CLICK_ID_SOURCES, clickIdSourceOf, type ClickIdSource } from './click-id.ts'
+
+export { REF_SOURCE_ALIASES, refSourceOf, type RefSource } from './ref-source.ts'
+
+export {
+  FILTER_DIMENSIONS,
+  FILTER_OPERATORS,
+  MAX_FILTER_CLAUSES,
+  MAX_FILTER_VALUES,
+  MAX_FILTER_VALUE_LENGTH,
+  describeFilters,
+  filterValuesFor,
+  hasActiveFilters,
+  isFilterDimension,
+  isFilterOperator,
+  normalizeFilters,
+  parseAnalyticsFilters,
+  type AnalyticsFilter,
+  type FilterAcceptance,
+  type FilterDimension,
+  type FilterOperator,
+  type FilterParseResult,
+  type FilterRefusal,
+} from './analytics-filters.ts'
+
 export {
   MAX_EVENT_AGE_MS,
   MAX_FUTURE_SKEW_MS,
@@ -498,13 +535,19 @@ export {
 export {
   IMPORTED_REPORTS,
   IMPORTED_REPORT_TABLES,
+  CITY_DROPPED_WARNING,
   DIMENSION_TRUNCATED_WARNING,
+  IMPORT_DEVICE_TOKENS,
   IMPORT_DIMENSION_MAX_BYTES,
   IMPORT_TRUNCATION_SENTINEL,
   IMPORT_FAILURE_CATEGORIES,
+  IMPORT_UNKNOWN_TOKEN,
   ImportRunFailure,
+  UNKNOWN_COLUMN_WARNING,
   createImportAdapterRegistry,
   importDateOf,
+  importLiveCountry,
+  importLiveToken,
   isImportDate,
   isImportFailureCategory,
   isImportedReport,
@@ -552,13 +595,22 @@ export {
 } from './imported-read.ts'
 
 export {
-  CITY_DROPPED_WARNING,
   PLAUSIBLE_PROVIDER_ID,
   ROWS_OUTSIDE_RANGE_WARNING,
-  UNKNOWN_COLUMN_WARNING,
   parsePlausibleCsvLine,
   plausibleImportAdapter,
 } from './import-adapters/plausible.ts'
+
+export {
+  DUPLICATE_EVENTS_WARNING,
+  UMAMI_MAX_STATE_ENTRIES,
+  UMAMI_PROVIDER_ID,
+  UMAMI_RECORD_INCOMPLETE,
+  UMAMI_RECORD_MALFORMED,
+  parseUmamiCsvRecord,
+  umamiImportAdapter,
+  type UmamiCsvRecord,
+} from './import-adapters/umami.ts'
 
 export {
   REVENUE_CREDENTIAL_STATUSES,
@@ -576,6 +628,7 @@ export {
   type RevenueAdapter,
   type RevenueAdapterRegistry,
   type RevenueCredentialVerification,
+  type RevenueEventContext,
   type RevenueEventNormalization,
   type RevenueFetchOutcome,
   type RevenueIgnoreReason,
@@ -584,6 +637,7 @@ export {
   type RevenueListPage,
   type RevenueNormalizeOutcome,
   type RevenueSyncFailure,
+  type RevenueWebhookHeaders,
   type RevenueWebhookVerification,
 } from './revenue-adapter.ts'
 
@@ -721,3 +775,11 @@ export {
   type SiteRole,
   type SiteState,
 } from './authz.ts'
+
+export {
+  SITE_CARD_SPARKLINE_WEEKS,
+  assembleSparkline,
+  siteCardWindow,
+  startOfUtcIsoWeek,
+  type SiteCardWindow,
+} from './site-cards.ts'

@@ -1,10 +1,10 @@
 "use client";
 
-import { CheckmarkCircle02Icon } from "hugeicons-react";
+import { Alert02Icon, CheckmarkCircle02Icon } from "hugeicons-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useRouter } from "next/navigation";
 import * as React from "react";
-import { cleanDomain, slugify } from "@/components/dashboard/add-site-dialog";
+import { slugify } from "@/components/dashboard/add-site-dialog";
 import { InstallOptions } from "@/components/dashboard/install-options";
 import { Favicon } from "@/components/dashboard/site-favicon";
 import { Logo } from "@/components/ui/logo";
@@ -24,9 +24,18 @@ import {
   sites,
   trackerSnippet,
   type CreatedSite,
+  type SiteSummary,
 } from "@/lib/api";
 import { useSession } from "@/lib/auth-client";
 import { MOCK_CREATED_SITE } from "@/lib/mock";
+import {
+  allowableDomain,
+  cleanDomain,
+  newestSighting,
+  sightingHost,
+  sightingKind,
+  type TagSighting,
+} from "@/lib/site-domain";
 
 /**
  * The mandatory first-run flow, in the order the product wants it
@@ -36,8 +45,11 @@ import { MOCK_CREATED_SITE } from "@/lib/mock";
  * footer language.
  *
  * The steps are a *list*, not four numbered branches, because a deployment can
- * add one: the hosted build inserts plan selection before verification
- * (`@seam/slots`), which is why the counter says "x / 4" here and "x / 5" there.
+ * add one: the hosted build appends plan selection after verification
+ * (`@seam/slots`), which is why the counter says "x / 4" here and "x / 5"
+ * there. Last on purpose (Abbas, 2026-08-18, after test-driving the trial
+ * himself): the snippet is the priority, and the plan ask lands once the
+ * setup work is done, when saying yes is the natural next move.
  * Everything else — the springs, the measured panel, the footer — is written
  * once against whatever the list turns out to be.
  *
@@ -46,9 +58,10 @@ import { MOCK_CREATED_SITE } from "@/lib/mock";
  * what opens the dashboard. A never-funded site has no countdown and is
  * never deleted for waiting, so "I'll do this later" is honest, not a trap.
  *
- * The timezone step writes `PATCH /v1/me/preferences` — the same value the
- * session then carries as `user.timezone`, which every analytics read
- * resolves through. The connect step watches `first_event_at` on the site
+ * The timezone step writes the answer twice: as the site's reporting timezone
+ * (`PATCH /v1/sites/{id}`), the calendar every window on the site is cut on,
+ * and as `PATCH /v1/me/preferences`, the fallback for a reader with no site to
+ * ask. The connect step watches `first_event_at` on the site
  * read: the install-verified signal, filled within ~1.5 s of the first event
  * and never moved again.
  */
@@ -86,8 +99,8 @@ const STEPS: readonly Step[] = [
   "site",
   "timezone",
   "install",
-  ...(onboardingStep ? (["extra"] as const) : []),
   "verify",
+  ...(onboardingStep ? (["extra"] as const) : []),
 ];
 
 const stepTitle = (step: Step): string =>
@@ -96,12 +109,24 @@ const stepTitle = (step: Step): string =>
     : STEP_TITLES[step];
 
 /**
- * Persists the chosen zone as the account preference. Fire-and-forget: a
- * failed write must not block onboarding — the browser zone stands in until
- * the settings screen stores one.
+ * Persists the chosen zone as the site's reporting timezone and as the account
+ * preference. Fire-and-forget: a failed write must not block onboarding.
+ *
+ * The site write is what every other analytics product does with this answer:
+ * it is the default every dashboard, share and widget window on the site is cut
+ * on, and a brand-new site left on UTC would report UTC's today. It is its own
+ * PATCH, never folded into the allowlist one, because the server validates the
+ * zone against its own ICU — a zone this browser knows and the api does not
+ * would otherwise take the domains down with it, and an empty allowlist
+ * accepts *every* origin rather than none.
  */
-function saveTimezone(timezone: string): void {
+function saveTimezone(timezone: string, siteId: string | null): void {
   if (!LIVE_API) return;
+  if (siteId !== null) {
+    void sites.update(siteId, { reporting_timezone: timezone }).catch(() => {
+      // The site keeps the UTC zone it was created with; settings changes it.
+    });
+  }
   void preferences.update(timezone).catch(() => {
     // Settings owns retrying; analytics reads fall back to the browser zone.
   });
@@ -143,6 +168,19 @@ export function OnboardingFlow() {
 
   /** The verify step: whether the site is accepting events yet. */
   const [siteActive, setSiteActive] = React.useState(!LIVE_API);
+
+  /**
+   * The verify step's second signal: where the tag has been seen fetching its
+   * configuration (ADR-0081, D3). `first_event_at` can only ever say "no", and
+   * says it identically to a page that was never installed and a page whose
+   * origin the allowlist refuses — which is what somebody who did everything
+   * right on `localhost:3000` would otherwise be told. `null` until a poll
+   * carries one, and the copy below is the copy it always was until then. The
+   * whole summary is kept rather than the sighting alone, because allowing a
+   * host appends to the site's own allowlist and the list it appends to has to
+   * be the one the server currently holds.
+   */
+  const [verified, setVerified] = React.useState<SiteSummary | null>(null);
 
   /**
    * Whether the account has been asked what it already has.
@@ -214,9 +252,6 @@ export function OnboardingFlow() {
     setStep(next);
   };
 
-  /** The step after the snippet — the optional one where it exists. */
-  const afterInstall: Step = onboardingStep ? "extra" : "verify";
-
   const slug = created?.slug ?? slugify(name) ?? "site";
   const publicToken =
     created?.tracking_key.public_token ??
@@ -286,6 +321,21 @@ export function OnboardingFlow() {
     router.replace(`/dashboard/${encodeURIComponent(slug)}`);
   }, [session, router, slug]);
 
+  /**
+   * Where a settled verify goes: the optional step where the build has one,
+   * else out to the dashboard. Also the verify step's "I'll do this later"
+   * exit, so a person who cannot deploy the snippet right now still meets
+   * the plan step instead of skipping past it.
+   */
+  const leaveVerify = React.useCallback(() => {
+    if (onboardingStep) {
+      setDir(1);
+      setStep("extra");
+    } else {
+      finish();
+    }
+  }, [finish]);
+
   // The verify step in mock mode plays the first event arriving on a timer.
   React.useEffect(() => {
     if (step !== "verify" || LIVE_API) return;
@@ -309,6 +359,10 @@ export function OnboardingFlow() {
         const site = await sites.get(created.site_id);
         if (cancelled) return;
         setSiteActive(site.status === "active");
+        // Kept per tick rather than latched: a sighting can change verdict
+        // between polls (the domain is allowed, the tag re-fetches its
+        // configuration), and the newest one is the one worth reporting.
+        setVerified(site);
         if (site.first_event_at !== null) setConnected(true);
       } catch {
         // The next tick retries; the person can leave via Back meanwhile.
@@ -322,11 +376,18 @@ export function OnboardingFlow() {
     };
   }, [step, created, connected]);
 
+  // The newest place the tag has been seen, off the poll's own read. Derived
+  // rather than stored, so there is one answer and the poll is its only source.
+  const sighting = newestSighting(verified);
+
+  // A settled connection advances by itself: out of the flow, or into the
+  // plan step where the build has one. Gated on the step so sitting on the
+  // plan step with a connected site does not keep re-firing the move.
   React.useEffect(() => {
-    if (!connected) return;
-    const redirect = setTimeout(() => finish(), 1400);
+    if (!connected || step !== "verify") return;
+    const redirect = setTimeout(() => leaveVerify(), 1400);
     return () => clearTimeout(redirect);
-  }, [connected, finish]);
+  }, [connected, step, leaveVerify]);
 
   // Below every hook, so the early return cannot change the hook order.
   // Holding the first paint rather than opening on step one and jumping:
@@ -449,8 +510,9 @@ export function OnboardingFlow() {
                   className="flex flex-col gap-2.5 p-4"
                 >
                   <p className="text-xs leading-5 text-muted-foreground">
-                    Your reports cut their days on this timezone. We picked
-                    your browser&apos;s.
+                    This site&apos;s reports cut their days on this timezone,
+                    and so do yours. We picked your browser&apos;s. Either can
+                    be changed later.
                   </p>
                   {/* The shared picker's field dress: collapsed it is one
                       input-height row, and the list it expands sits in the
@@ -497,7 +559,7 @@ export function OnboardingFlow() {
                   transition={SPRING}
                   className="flex flex-col gap-2.5 p-4"
                 >
-                  <onboardingStep.Body onDone={() => goTo("verify")} />
+                  <onboardingStep.Body onDone={finish} />
                 </motion.div>
               )}
               {step === "verify" && (
@@ -577,15 +639,24 @@ export function OnboardingFlow() {
                     </AnimatePresence>
                   </div>
 
-                  <div className="text-center">
+                  {/* The step's own report on itself, and the one part of
+                      this screen that changes without anybody pressing
+                      anything — so it is announced rather than only drawn. */}
+                  <div
+                    aria-live="polite"
+                    className="flex flex-col items-center text-center"
+                  >
                     <p className="text-sm font-medium text-foreground/80">
                       {connected
                         ? "First event received!"
                         : "Waiting for the first event…"}
                     </p>
+                    {connected || !siteActive || sighting === null ? (
                     <p className="mt-1 max-w-64 text-xs leading-5 text-muted-foreground">
                       {connected
-                        ? "Taking you to your project."
+                        ? onboardingStep
+                          ? "One more step and you're in."
+                          : "Taking you to your project."
                         : !siteActive
                           ? // The site is not open for events yet — no
                             // snippet is wrong yet, and the copy must not say
@@ -595,6 +666,13 @@ export function OnboardingFlow() {
                             "This site isn't open for events yet (a few seconds, usually). We start counting the moment it is."
                           : `Open ${cleanDomain(domain) ?? (domain || "your site")} and browse around. We'll pick up the first pageview within seconds.`}
                     </p>
+                    ) : (
+                      // The site is open, nothing has arrived, and the
+                      // collector has seen the tag somewhere: that "somewhere"
+                      // is the whole answer, so it is said instead of the
+                      // generic instruction (ADR-0081, D4).
+                      <VerifySighting site={verified} sighting={sighting} />
+                    )}
                   </div>
                 </motion.div>
               )}
@@ -618,7 +696,7 @@ export function OnboardingFlow() {
               <Button
                 size="xs"
                 onClick={() => {
-                  saveTimezone(timezone);
+                  saveTimezone(timezone, created?.site_id ?? null);
                   goTo("install");
                 }}
               >
@@ -626,12 +704,15 @@ export function OnboardingFlow() {
               </Button>
             )}
             {step === "install" && (
-              <Button size="xs" onClick={() => goTo(afterInstall)}>
+              <Button size="xs" onClick={() => goTo("verify")}>
                 Continue
               </Button>
             )}
             {step === "extra" && onboardingStep && (
               <>
+                {/* Back skips over verify to the snippet: a connected verify
+                    advances itself, so landing on it would bounce straight
+                    back here. */}
                 <Button
                   variant="secondary"
                   size="xs"
@@ -644,9 +725,6 @@ export function OnboardingFlow() {
             )}
             {step === "verify" && (
               <>
-                {/* Back goes to the snippet, never to the optional step: that
-                    one advances itself, so landing on it already satisfied
-                    would bounce straight back here. */}
                 <Button
                   variant="secondary"
                   size="xs"
@@ -654,14 +732,173 @@ export function OnboardingFlow() {
                 >
                   Back
                 </Button>
-                <Button size="xs" loading={!connected} onClick={finish}>
-                  {connected ? "Go to project" : "Waiting…"}
+                {!connected ? (
+                  // The waiting must be leavable: the snippet may not be
+                  // deployable today, and moving on is forward, never out,
+                  // so the plan step still gets its moment on the hosted
+                  // build.
+                  <Button size="xs" variant="secondary" onClick={leaveVerify}>
+                    I&apos;ll do this later
+                  </Button>
+                ) : null}
+                <Button size="xs" loading={!connected} onClick={leaveVerify}>
+                  {connected
+                    ? onboardingStep
+                      ? "Continue"
+                      : "Go to project"
+                    : "Waiting…"}
                 </Button>
               </>
             )}
           </div>
         </SquircleSurface>
       </div>
+    </div>
+  );
+}
+
+/**
+ * What the verify step says once the collector has seen the tag (ADR-0081, D4).
+ *
+ * The step waits on an event, and until now it could only describe the waiting.
+ * A sighting turns it into a report: the tag has loaded, here is where, and
+ * here is whether anything from there will ever be counted. The three shapes
+ * are the three answers, and only one of them is a problem somebody can press
+ * a button about.
+ *
+ * `allowed` is the collector's own verdict, recorded when the tag fetched its
+ * configuration. It is never recomputed here, so this step cannot promise data
+ * from an origin the ingest gate refuses.
+ *
+ * `SiteAddressRow` below this fixes the *other* mistake — the site's own
+ * address typed wrong — and the two do not overlap: that one replaces the
+ * allowlist with the address it should always have had, this one appends a
+ * second host that was never meant to be the site's address at all (a preview
+ * deployment, a staging domain).
+ */
+function VerifySighting({
+  site,
+  sighting,
+}: {
+  site: SiteSummary | null;
+  sighting: TagSighting;
+}) {
+  const [busy, setBusy] = React.useState(false);
+  const [failed, setFailed] = React.useState<string | null>(null);
+  /**
+   * Written, and the sighting does not know yet: `allowed` is decided when the
+   * tag next fetches its configuration, which happens on the next page load.
+   * Between the press and that load the only honest thing to say is that the
+   * domain is on the list and the site wants one reload.
+   */
+  const [added, setAdded] = React.useState(false);
+
+  const host = sightingHost(sighting.origin) ?? "";
+  const kind = sightingKind(sighting);
+  const firstDomain = cleanDomain(site?.domains[0] ?? "") ?? "your domain";
+  const domain = allowableDomain(sighting.origin);
+
+  const allow = () => {
+    if (busy || site === null || domain === null) return;
+    setBusy(true);
+    setFailed(null);
+    // The PATCH replaces the whole allowlist, so the site's existing domains
+    // travel with the new one. Deduped: a list carrying the same host twice is
+    // a write nobody meant to make.
+    const domains = site.domains.includes(domain)
+      ? site.domains
+      : [...site.domains, domain];
+    sites.update(site.site_id, { domains }).then(
+      () => {
+        setBusy(false);
+        setAdded(true);
+      },
+      (raised: unknown) => {
+        setBusy(false);
+        setFailed(presentError(raised).body);
+      }
+    );
+  };
+
+  // A callout in the product's warning or success colour rather than a grey
+  // sentence: the first live test read the console line and walked past the
+  // same words set in muted text (same reasoning as the dashboard's gate).
+  const refused = kind !== "allowed";
+  const tone = refused
+    ? "bg-warning/10 text-warning-foreground"
+    : "bg-success/10 text-success-foreground";
+  const Icon = refused ? Alert02Icon : CheckmarkCircle02Icon;
+  const line = "text-sm leading-6";
+  const strong = "font-semibold";
+
+  let body: React.ReactNode;
+  if (kind === "allowed") {
+    body = (
+      <p className={line}>
+        The tag has loaded on <span className={strong}>{host}</span>. The first
+        event is on its way, usually within seconds.
+      </p>
+    );
+  } else if (kind === "local") {
+    body = (
+      <p className={line}>
+        The tag has loaded on <span className={strong}>{host}</span>. Visits
+        from a local host aren&apos;t counted while the site has an allowed
+        domain, and localhost can&apos;t be added. Open the site at{" "}
+        <span className={strong}>{firstDomain}</span> to see data.
+      </p>
+    );
+  } else {
+    body = (
+      <>
+        <p className={line}>
+          {added ? (
+            <>
+              <span className={strong}>{host}</span> is on this site&apos;s
+              allowed domains now.
+            </>
+          ) : (
+            <>
+              The tag has loaded on <span className={strong}>{host}</span>,
+              which isn&apos;t on this site&apos;s allowed domains.
+            </>
+          )}
+        </p>
+        {added || domain === null ? null : (
+          <Button
+            className="mt-2.5"
+            loading={busy}
+            onClick={allow}
+            size="xs"
+            variant="secondary"
+          >
+            Allow this domain
+          </Button>
+        )}
+        {domain === null ? null : (
+          // Same caveat as the dashboard gate: the tag's configuration is
+          // cached for five minutes, so one reload is not a promise.
+          <p className="mt-1.5 text-xs leading-4">
+            Then reload your site. The tag picks the change up within about
+            five minutes.
+          </p>
+        )}
+        {failed !== null ? (
+          <p className="mt-1.5 text-xs leading-4 text-destructive-foreground">
+            {failed}
+          </p>
+        ) : null}
+      </>
+    );
+  }
+
+  return (
+    <div
+      className={`mt-3 flex w-full max-w-80 items-start gap-2.5 rounded-xl px-3.5 py-3 text-left ${tone}`}
+      role="status"
+    >
+      <Icon aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+      <div className="flex min-w-0 flex-col items-start">{body}</div>
     </div>
   );
 }

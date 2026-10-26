@@ -196,7 +196,7 @@ describe('the staging vocabulary and the deletion registry (D9)', () => {
     }
   })
 
-  it('has grown to the 62-target snapshot', () => {
+  it('has settled on the 61-target snapshot', () => {
     // 30 ClickHouse + 5 Redis + 19 Postgres + 1 object. The number changed on
     // purpose — 35 before M11, 38 after its CP1, 46 after CP2, 47 once CP4 added
     // `export_runs` (ADR-0032, D9), 48 once M12 CP1 added `revenue_credentials`,
@@ -212,10 +212,52 @@ describe('the staging vocabulary and the deletion registry (D9)', () => {
     // join the one snapshotted key list beside the import archives, and revenue
     // adds no object target at all because provider payload bodies are never
     // persisted.
-    expect(DELETION_CLICKHOUSE_TARGETS).toHaveLength(35)
+    //
+    // ADR-0068 removed `events_preview` (migration 0022) — the first time the
+    // ClickHouse set has ever shrunk.
+    // ADR-0079 D1 books the eight `*_15m` rollups (ClickHouse migration 0025),
+    // taking ClickHouse 34 -> 42 and the total 62 -> 70. One 15m twin per
+    // additive 1h family, nothing on the Postgres side: the read path does not
+    // change in that step, so no row, key or object moved with it.
+    // ADR-0079's second step books the other two 15m grains -- the session
+    // finalizer's `session_rollups_15m` and the attribution job's `revenue_15m`
+    // (ClickHouse migration 0026) -- taking ClickHouse 42 -> 44 and the total
+    // 70 -> 72. Written by the worker rather than by a materialized view, which
+    // changes how they are granted and filled and changes nothing about how
+    // they are purged.
+    // ClickHouse migration 0029 (v0.8.0) dropped the ten hour tables — the
+    // eight `*_1h` view targets, `session_rollups_1h` and `revenue_1h` —
+    // taking ClickHouse 44 -> 34 and the total 72 -> 62. Nothing had written
+    // them since 0027, and the 15m backfill's gate reads `events_raw` now.
+    expect(DELETION_CLICKHOUSE_TARGETS).toHaveLength(34)
+    for (const dropped of [
+      'metrics_1h',
+      'pages_1h',
+      'sources_1h',
+      'geography_1h',
+      'devices_1h',
+      'custom_events_1h',
+      'performance_1h',
+      'custom_event_samples_1h',
+      'session_rollups_1h',
+      'revenue_1h',
+    ]) {
+      expect(DELETION_CLICKHOUSE_TARGETS).not.toContain(dropped)
+    }
+    for (const family of [
+      'metrics',
+      'pages',
+      'sources',
+      'geography',
+      'devices',
+      'custom_events',
+      'performance',
+      'custom_event_samples',
+    ]) {
+      expect(DELETION_CLICKHOUSE_TARGETS).toContain(`${family}_15m`)
+    }
     expect(DELETION_CLICKHOUSE_TARGETS).toContain('revenue_events')
     expect(DELETION_CLICKHOUSE_TARGETS).toContain('revenue_attributions')
-    expect(DELETION_CLICKHOUSE_TARGETS).toContain('revenue_1h')
     expect(DELETION_CLICKHOUSE_TARGETS).toContain('revenue_1d')
     expect(DELETION_POSTGRES_TARGETS).toContain('export_runs')
     expect(DELETION_POSTGRES_TARGETS).toContain('revenue_credentials')
@@ -225,17 +267,16 @@ describe('the staging vocabulary and the deletion registry (D9)', () => {
     expect(DELETION_POSTGRES_TARGETS).toContain('revenue_match_hints')
     expect(DELETION_POSTGRES_TARGETS).toContain('revenue_attribution_state')
     // M13 CP1 books the event builder's two tables (ADR-0034, D9; Postgres
-    // migration 0038), taking Postgres 19 -> 21 and the total 57 -> 59. The
-    // milestone's booked end state is 60: `events_preview` (ClickHouse 0020)
-    // arrives in CP5 and moves the ClickHouse count in its own commit.
+    // migration 0038), taking Postgres 19 -> 21 and the total 57 -> 59.
+    // (`events_preview`, which M13 CP5 added on the ClickHouse side, was
+    // removed again by ADR-0068 — migration 0022 drops the table.)
     expect(DELETION_POSTGRES_TARGETS).toContain('event_definitions')
     expect(DELETION_POSTGRES_TARGETS).toContain('event_definition_versions')
-    expect(DELETION_CLICKHOUSE_TARGETS).toContain('events_preview')
+    expect(DELETION_CLICKHOUSE_TARGETS).not.toContain('events_preview')
     // ADR-0038 D8 books the custom-events decoration's two tables (ClickHouse
     // migration 0021), taking ClickHouse 33 -> 35 and the total 60 -> 62. An
     // aggregate outlives the rows it came from, so these are targets in their
     // own right rather than something purging `events_raw` handles.
-    expect(DELETION_CLICKHOUSE_TARGETS).toContain('custom_event_samples_1h')
     expect(DELETION_CLICKHOUSE_TARGETS).toContain('custom_event_samples_1d')
     // ADR-0045 D8 books the widget configuration table (Postgres migration
     // 0048), taking Postgres 21 -> 22 and the total 62 -> 63. One table and not
@@ -246,7 +287,7 @@ describe('the staging vocabulary and the deletion registry (D9)', () => {
     // the `sites` cascade.
     expect(DELETION_POSTGRES_TARGETS).toContain('widgets')
     expect(DELETION_POSTGRES_TARGETS).toHaveLength(22)
-    expect(SITE_DELETION_TARGETS).toHaveLength(63)
+    expect(SITE_DELETION_TARGETS).toHaveLength(62)
   })
 })
 

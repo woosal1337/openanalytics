@@ -10,6 +10,8 @@ import {
   useSiteAnalytics,
 } from "@/components/dashboard/analytics-card";
 import { ImportedGapNote } from "@/components/dashboard/data-state";
+import { useAnalyticsFilters } from "@/components/dashboard/filter-context";
+import { usePublishPosterCountries } from "@/components/dashboard/poster-publishers";
 import { HoverList } from "@/components/dashboard/hover-list";
 import {
   SeeAllModal,
@@ -115,8 +117,28 @@ function countryName(code: string): string {
 }
 
 export function LocationsCard() {
-  const resource = useSiteAnalytics(getAnalyticsGeography, MOCK_GEOGRAPHY);
+  const { enabled, active, filtersParam, addFilter, hasValue } =
+    useAnalyticsFilters();
+  const resource = useSiteAnalytics(getAnalyticsGeography, MOCK_GEOGRAPHY, {
+    filters: filtersParam,
+  });
   const [view, setView] = React.useState<LocationView>("countries");
+
+  // The country fold for the share poster, whichever cut the header shows.
+  const posterRows = React.useMemo(
+    () =>
+      resource.status === "ready"
+        ? foldCountries(resource.data.items).map((place) => ({
+            code: place.country,
+            visitors: place.visitors,
+          }))
+        : null,
+    [resource]
+  );
+  usePublishPosterCountries(
+    posterRows,
+    resource.status === "ready" && resource.data.meta.truncated
+  );
   const [open, setOpen] = React.useState(false);
   const current = VIEWS.find((entry) => entry.id === view) ?? VIEWS[0];
 
@@ -162,7 +184,11 @@ export function LocationsCard() {
       }
     >
       <AnalyticsCardBody
-        emptyBody="No visits in this range yet."
+        emptyBody={
+          active
+            ? "No visits match these filters."
+            : "No visits in this range yet."
+        }
         isEmpty={(data) => data.items.length === 0}
         resource={resource}
       >
@@ -216,6 +242,26 @@ export function LocationsCard() {
                             view === "countries"
                               ? countryName(place.country)
                               : place.label
+                          }
+                          // The filter takes what the session entry stores:
+                          // the ISO code for a country, the raw city string
+                          // for a city, never the display name.
+                          onSelect={
+                            enabled &&
+                            // Nothing to add when this place is already in the
+                            // clause, so the row stops offering the press.
+                            !hasValue(
+                              view === "countries" ? "country" : "city",
+                              view === "countries" ? place.country : place.label
+                            )
+                              ? () =>
+                                  addFilter(
+                                    view === "countries" ? "country" : "city",
+                                    view === "countries"
+                                      ? place.country
+                                      : place.label
+                                  )
+                              : undefined
                           }
                           pct={share(place.visitors)}
                           value={place.visitors.toLocaleString("en-US")}

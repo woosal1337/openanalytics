@@ -103,13 +103,27 @@ const serviceSchemas = {
     // gateway's own QUERY_TIMEOUT_MS so the gateway's typed timeout normally
     // surfaces first and the API's is the backstop against a hung socket.
     QUERY_GATEWAY_TIMEOUT_MS: z.coerce.number().int().min(100).max(60_000).default(20_000),
+    /**
+     * The sites-grid card figures (ADR-0080). Three numbers, all with working
+     * defaults, so a deployment that sets none still gets the feature.
+     *
+     * `SITES_CARD_GATEWAY_TIMEOUT_MS` is deliberately far below
+     * `QUERY_GATEWAY_TIMEOUT_MS` above: `GET /v1/sites` is the dashboard shell's
+     * own load and these figures decorate it, so the shell must never wait on
+     * them the way a chart the viewer asked for is allowed to (D6). Past the
+     * deadline the list still answers — with `null` figures, which the contract
+     * defines as "not computed" rather than zero.
+     *
+     * `SITES_CARD_CACHE_TTL_MS` is the per-account cache (D5); `0` disables it.
+     * `SITES_CARD_MAX_SITES` is the fan-out ceiling: an account with more sites
+     * than this gets figures for the first N and `null` for the rest, which is
+     * an interpretable partial answer rather than a refused list. Prod's largest
+     * account held 4 sites when this shipped.
+     */
+    SITES_CARD_CACHE_TTL_MS: z.coerce.number().int().min(0).max(3_600_000).default(300_000),
+    SITES_CARD_GATEWAY_TIMEOUT_MS: z.coerce.number().int().min(100).max(30_000).default(3_000),
+    SITES_CARD_MAX_SITES: z.coerce.number().int().min(1).max(100).default(100),
     REALTIME_TOKEN_SIGNING_KEY: secret.optional(),
-    // Mints rule-preview tokens (ADR-0034, D6). Its verify half sits on the
-    // collector; this private half is on the collector's FORBIDDEN_KEYS list, so
-    // the service that checks a preview token can never mint one. Optional: a
-    // deployment without it simply cannot start a preview, and the endpoint says
-    // so rather than the api refusing to boot over one feature.
-    PREVIEW_TOKEN_SIGNING_KEY: secret.optional(),
     REALTIME_CACHE_REDIS_URL: url.optional(),
     // Social login runs in the API (Better Auth). Providers are env-gated: a
     // provider is only offered when both its id and secret are present, so a
@@ -318,16 +332,6 @@ const serviceSchemas = {
      * refreshed monthly on the host and never committed.
      */
     GEOIP_DB_PATH: z.string().min(1).optional(),
-    /**
-     * Verify-only half of the rule-preview token (ADR-0034, D6). The api mints;
-     * this service only ever checks, and `PREVIEW_TOKEN_SIGNING_KEY` is on its
-     * FORBIDDEN_KEYS list below.
-     *
-     * Unset, `GET /v1/tracker/config?preview=…` ignores the parameter and serves
-     * the published rule set — a preview that cannot be authenticated is served
-     * as no preview at all, never as an unauthenticated one.
-     */
-    PREVIEW_TOKEN_VERIFY_KEY: z.string().min(16).optional(),
   }),
 
   worker: baseSchema.extend({
@@ -595,10 +599,6 @@ const FORBIDDEN_KEYS: Readonly<Record<ServiceEnvName, readonly string[]>> = {
     'SMTP_PASS',
     'GOOGLE_CLIENT_SECRET',
     'GITHUB_CLIENT_SECRET',
-    // The collector verifies preview tokens and must never mint one (ADR-0034,
-    // D6). Holding this key would let a compromised collector serve itself any
-    // site's unpublished rules.
-    'PREVIEW_TOKEN_SIGNING_KEY',
     // NOTE: ANONYMOUS_IDENTITY_SECRET is deliberately NOT in this list — the
     // collector is the one service that must hold it (its own schema above).
     // It sat here from M4 until the first real deployment (2026-07-24), when

@@ -104,7 +104,14 @@ keepable. Not before.
    `git describe` would hand a self-hoster the candidate. The version numbers
    still spelled out in `SELF-HOSTING.md` are illustrations; refresh them in the
    same commit so nobody compares a stale number against what they just
-   installed.
+   installed. The platform blueprints resolve nothing:
+   `infra/selfhost/docker-compose.coolify.yml`,
+   `infra/selfhost/dokploy/docker-compose.yml` and `dokploy/meta.json` pin the
+   release outright, `dokploy/import.base64.txt` embeds that compose, and
+   `COOLIFY.md` and `DOKPLOY.md` spell the number. Bump all of them in the same
+   commit and regenerate the import blob with the one-liner in `DOKPLOY.md`.
+   `v0.6.0` went out without this, and every platform install of it pulled
+   `v0.5.0`.
 3. `git tag -a v0.1.0 -m "v0.1.0"` and push the tag.
 4. `.github/workflows/release.yml` fires on the tag: it checks the version
    agreement, builds the ten images and pushes them to
@@ -113,8 +120,13 @@ keepable. Not before.
 5. Watch it. **A release whose workflow failed is a tag pointing at images that
    do not exist**, and the failure mode for whoever tries it is a `docker
 compose pull` that cannot find a manifest.
-6. Write the release notes on the GitHub release. What changed, and — first,
-   before anything else — whatever an upgrading operator has to do by hand.
+6. Add the entry to `CHANGELOG.md` in the same commit as the version bump. It
+   opens with what an upgrading operator has to do by hand, or with
+   **Upgrade notes: none** — that line is the first thing somebody looks for
+   and the reason the file exists rather than a list of commits.
+7. Write the release notes on the GitHub release. They are the CHANGELOG entry
+   for this version, pasted: two places that say different things about one
+   release is the drift this file exists to prevent.
 
 **Pre-releases** are `vX.Y.Z-rc.N`. They publish the same ten images under the
 pre-release tag and deliberately do not move `latest`, so the way to test the

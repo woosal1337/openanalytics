@@ -88,6 +88,7 @@ import { requireCapability, siteMembership, type ApiVariables } from './middlewa
 import { createSiteToApiError, ownershipToApiError } from './ownership-errors.ts'
 import { principalAuth } from './grant-arm.ts'
 import type { CredentialUseRecorder } from './credential-events.ts'
+import type { SiteCardStatsReader, SiteCardSubject } from '../analytics/site-cards.ts'
 import type { ApiCloudExtension } from '../cloud-extension.ts'
 
 /**
@@ -108,6 +109,14 @@ export interface RoutesDeps {
   /** Analytics read service. Present only when a query gateway is configured; the
    * `/analytics` surface is not mounted otherwise (the optional-until-used rule). */
   readonly analytics?: AnalyticsService
+  /**
+   * The sites-grid card figures (ADR-0080). Present only when the query gateway
+   * is, for the same reason `analytics` is — and absent it the list still
+   * answers, with `null` figures, which the contract defines as "not computed"
+   * rather than zero. A deployment with no gateway therefore serves a correct
+   * site list rather than a wrong one.
+   */
+  readonly siteCards?: SiteCardStatsReader
   /** Realtime cache. Present only when the realtime cache client is configured; it
    * mints the private realtime token (epoch seed) and drives the best-effort
    * revocation bumps (docs snapshot 02 §17, 05 D-213). */
@@ -192,6 +201,49 @@ async function revokeRealtimeAccess(
   }
 }
 
+/**
+ * Where this site's tag has been seen loading (ADR-0081, D3).
+ *
+ * Three things decide the answer, and only one of them is a cache read:
+ *
+ * - the site already has `first_event_at` — the stronger install signal
+ *   (ADR-0027) exists, so this weaker one has nothing left to say and is not
+ *   computed at all. That is also what keeps the read off every other request:
+ *   an installed site never touches the cache again;
+ * - no realtime cache in this deployment — nothing was ever recorded, so
+ *   nothing can be reported;
+ * - the read itself failed.
+ *
+ * All three answer `null`, and **never `[]`**. An empty array is a measurement
+ * with a meaning of its own here — the cache was read and the tag has not loaded
+ * anywhere in 24 hours, which is the screen's "check that the script is on the
+ * page" case. A failed read reported as `[]` would state that as fact
+ * (AGENTS.md: a provider failure is never an empty result).
+ */
+async function tagSightingsFor(
+  cache: RealtimeCache | undefined,
+  site: SiteForUser,
+  logger: Logger | undefined,
+): Promise<{ origin: string; seen_at: string; allowed: boolean }[] | null> {
+  if (site.firstEventAt !== null || !cache) return null
+
+  try {
+    const sightings = await cache.readTagSightings({ siteId: site.siteId })
+    return sightings.map((sighting) => ({
+      origin: sighting.origin,
+      seen_at: sighting.at,
+      allowed: sighting.allowed,
+    }))
+  } catch (err) {
+    logger?.warn('tag_sightings_read_failed', {
+      err,
+      site_id: site.siteId,
+      retryable: true,
+    })
+    return null
+  }
+}
+
 function siteJson(site: SiteForUser) {
   return {
     site_id: site.siteId,
@@ -224,11 +276,11 @@ function siteJson(site: SiteForUser) {
     // shell already loads rather than only on the revenue surface — otherwise a
     // client shows the wrong symbol for the length of one request.
     reporting_currency: site.reportingCurrency,
-    // The site's own reporting clock (ADR-0044, D4). Required-and-nullable, the
-    // ADR-0027 convention, so `null` is a statement: nobody has configured one
-    // and the viewer's clock applies. It changes no private query — the
-    // dashboard still sends the reader's zone (ADR-0026) — and exists so the
-    // settings screen can render it and the public share board can be served it.
+    // The site's own reporting clock (ADR-0044 D4, ADR-0079 D5). Always a zone
+    // since migration 0046: it is the default every window on this site is cut
+    // on, for the dashboard, the share board and every widget alike, which is
+    // why the summary the shell already loads carries it rather than a second
+    // request per screen.
     reporting_timezone: site.reportingTimezone,
   }
 }
@@ -594,16 +646,7 @@ export function createBusinessRoutes(deps: RoutesDeps): Hono<Env> {
 
   // Dashboard-defined custom events (ADR-0034). Unconditional for the same
   // reason as funnels: a definition is a Postgres write and needs no gateway.
-  // The preview route is the one part that can be unavailable, and it says so
-  // itself rather than being absent from the routing table — a missing signing
-  // key is an operator problem, not a 404.
-  authed.route(
-    '/',
-    createEventDefinitionRoutes({
-      db,
-      previewSigningKey: env.PREVIEW_TOKEN_SIGNING_KEY,
-    }),
-  )
+  authed.route('/', createEventDefinitionRoutes({ db }))
 
   // The import provider catalog (ADR-0032, D11). Unconditional, like the funnels
   // surface and unlike the site-scoped import routes below: it is a static list
@@ -692,10 +735,36 @@ export function createBusinessRoutes(deps: RoutesDeps): Hono<Env> {
     )
   }
 
+  /**
+   * The caller's sites, each with the figures its card renders (ADR-0080).
+   *
+   * The figures are a decoration on a list that must always answer: the whole
+   * dashboard shell loads through this route, so `SiteCardStatsReader` never
+   * throws and a site it could not compute comes back with `null` figures rather
+   * than a missing key or a 5xx. `null` is a statement in this contract — "not
+   * computed for this response" — and is never the same claim as zero.
+   */
   authed.get('/sites', async (c) => {
     const user = c.get('user')
     const sites = await listSitesForUser(db, user.id)
-    return c.json({ items: sites.map(siteJson) })
+    const cards = deps.siteCards
+      ? await deps.siteCards.read(
+          user.id,
+          sites.map((site): SiteCardSubject => ({
+            siteId: site.siteId,
+            role: site.role,
+            status: site.status,
+            firstEventAt: site.firstEventAt,
+            reportingCurrency: site.reportingCurrency,
+          })),
+        )
+      : undefined
+    return c.json({
+      items: sites.map((site) => ({
+        ...siteJson(site),
+        ...(cards?.get(site.siteId) ?? { all_time: null, sparkline: null }),
+      })),
+    })
   })
 
   /**
@@ -785,7 +854,12 @@ export function createBusinessRoutes(deps: RoutesDeps): Hono<Env> {
     const { siteId } = c.get('membership')
     const site = await getSiteForUser(db, { siteId, userId: user.id })
     if (!site) throw new ApiError('SITE_NOT_FOUND', 'No such site')
-    return c.json(siteJson(site))
+    // The single-site read only (ADR-0081, D3): this is what the two waiting
+    // screens poll, and the list is loaded on every screen of the product.
+    return c.json({
+      ...siteJson(site),
+      tag_sightings: await tagSightingsFor(deps.realtime?.cache, site, c.get('logger')),
+    })
   })
 
   /**
@@ -897,13 +971,18 @@ export function createBusinessRoutes(deps: RoutesDeps): Hono<Env> {
    * origin allowlist is trusted with the label the numbers are denominated in.
    * Reading the numbers stays owner-only.
    *
-   * **`reporting_timezone` is the site's own clock** (ADR-0044, D4), and it is
-   * this route's second non-bumping field for the same reason as the first. It
-   * is an *override* on ADR-0026's user preference, never a replacement:
-   * `users.timezone` is still what the dashboard sends on every analytics
-   * request, and setting this changes no private query. What it does is give the
-   * public share board a zone of the site's own, so two viewers in two countries
-   * stop cutting different buckets behind one link. `null` clears it.
+   * **`reporting_timezone` is the site's own clock** (ADR-0044 D4, ADR-0079 D5),
+   * and it is this route's second non-bumping field for the same reason as the
+   * first. Every window this product cuts — the dashboard's, the share board's,
+   * every widget's — starts and ends on it, so two viewers in two countries stop
+   * cutting different buckets behind one link, and ADR-0026's user preference is
+   * the fallback for a reader with no site to ask rather than the default.
+   *
+   * **`null` is refused.** It cleared the setting while the column was nullable;
+   * since migration 0046 there is no such state to return to, and a site with no
+   * clock is a site whose readers disagree about what a week is. A reader who
+   * wants their own zone switches to it from the dashboard's header pill, which
+   * is a view and writes nothing.
    */
   authed.patch(
     '/sites/:site_id',
@@ -927,18 +1006,18 @@ export function createBusinessRoutes(deps: RoutesDeps): Hono<Env> {
         ])
       }
 
-      let reportingTimezone: string | null | undefined
+      let reportingTimezone: string | undefined
       if (hasReportingTimezone) {
         const raw = body['reporting_timezone']
-        // `null` clears the setting and is a deliberate value, exactly as it is
-        // on `PATCH /v1/me/preferences` (ADR-0026, decision 5). Everything else
-        // must be a string the *runtime's* tz database recognises — and
-        // `isValidTimezone` is that check, reused rather than reimplemented, so
-        // an offset zone like `+05:00` is refused here too. Without its shape
-        // guard an offset would pass and then be refused by the column CHECK as
-        // an unhandled 500: a caller's mistake turned into our error.
-        if (raw !== null && (typeof raw !== 'string' || !isValidTimezone(raw))) {
-          validationFailed('reporting_timezone must be a valid IANA identifier or null', [
+        // A string the *runtime's* tz database recognises, and nothing else —
+        // `null` included, which used to clear the setting and no longer has a
+        // state to clear it to (migration 0046). `isValidTimezone` is the
+        // existence check, reused rather than reimplemented, so an offset zone
+        // like `+05:00` is refused here too. Without its shape guard an offset
+        // would pass and then be refused by the column CHECK as an unhandled
+        // 500: a caller's mistake turned into our error.
+        if (typeof raw !== 'string' || !isValidTimezone(raw)) {
+          validationFailed('reporting_timezone must be a valid IANA identifier', [
             {
               field: 'reporting_timezone',
               code: 'invalid',
@@ -949,7 +1028,7 @@ export function createBusinessRoutes(deps: RoutesDeps): Hono<Env> {
             },
           ])
         }
-        reportingTimezone = raw as string | null
+        reportingTimezone = raw
       }
 
       let reportingCurrency: string | undefined

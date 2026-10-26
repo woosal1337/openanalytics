@@ -67,7 +67,7 @@ describe('ClickHouse migration files split into statements', () => {
     // A guard on the guard: a glob that silently matched nothing would make every
     // assertion below vacuous.
     const files = await migrationFiles()
-    expect(files.length).toBeGreaterThanOrEqual(18)
+    expect(files.length).toBeGreaterThanOrEqual(27)
     expect(files.map((file) => file.name)).toContain('0018_revenue_rollups.sql')
   })
 
@@ -116,6 +116,92 @@ describe('ClickHouse migration files split into statements', () => {
     for (const statement of statements) {
       expect(statement).toContain('ReplacingMergeTree(generation)')
       expect(statement).toContain('non_replicated_deduplication_window = 1000')
+    }
+  })
+
+  it('produces exactly the two swap tables from 0026, and no view', async () => {
+    // ADR-0079 step 2. The same shape as the 0018 assertion above, and here it
+    // carries a second claim: `_mv` appears nowhere. The eight tables of 0025
+    // each came with a materialized view, so a copy-paste that brought one
+    // along would be the easy mistake -- and a view over these would be
+    // structurally wrong for the reason D-211 gives about revenue, and wrong
+    // again for sessions, whose rows are versioned facts a view cannot retract.
+    const file = (await migrationFiles()).find(
+      (entry) => entry.name === '0026_session_revenue_rollups_15m.sql',
+    )
+    expect(file).toBeDefined()
+    const sql = (file as { sql: string }).sql
+    const statements = splitStatements(sql)
+    expect(statements).toHaveLength(2)
+    expect(statements[0]).toMatch(/^CREATE TABLE IF NOT EXISTS session_rollups_15m\b/u)
+    expect(statements[1]).toMatch(/^CREATE TABLE IF NOT EXISTS revenue_15m\b/u)
+    for (const statement of statements) {
+      expect(statement).toContain('ReplacingMergeTree(generation)')
+      expect(statement).toContain('non_replicated_deduplication_window = 1000')
+      expect(statement).toContain('PARTITION BY toYYYYMM(bucket_start)')
+      expect(statement).toContain('ORDER BY (site_id, bucket_start)')
+      expect(statement).not.toMatch(/MATERIALIZED\s+VIEW/iu)
+    }
+  })
+
+  it('drops eight views and not one table in 0027', async () => {
+    // ADR-0079 step 4. The shape of this file is the whole decision: the hour
+    // grain stops being WRITTEN and stays READABLE, so eight views go and not a
+    // single table does. A `DROP TABLE` slipping in here would have taken the
+    // 15m backfill's equality gate and the deletion workflow's targets with it
+    // (0029 drops the tables a release later, once neither needs them), and
+    // it would be irreversible in the one direction that matters -- the rows
+    // are gone, whereas a dropped view can be recreated and replayed from
+    // `events_raw`.
+    const file = (await migrationFiles()).find(
+      (entry) => entry.name === '0027_drop_hour_materialized_views.sql',
+    )
+    expect(file).toBeDefined()
+    const statements = splitStatements((file as { sql: string }).sql)
+    expect(statements).toHaveLength(8)
+    expect(statements).toEqual([
+      'DROP VIEW IF EXISTS metrics_1h_mv',
+      'DROP VIEW IF EXISTS pages_1h_mv',
+      'DROP VIEW IF EXISTS sources_1h_mv',
+      'DROP VIEW IF EXISTS geography_1h_mv',
+      'DROP VIEW IF EXISTS devices_1h_mv',
+      'DROP VIEW IF EXISTS custom_events_1h_mv',
+      'DROP VIEW IF EXISTS performance_1h_mv',
+      'DROP VIEW IF EXISTS custom_event_samples_1h_mv',
+    ])
+    for (const statement of statements) {
+      // Idempotent, like every statement the README's rules demand: the ledger
+      // marks a migration pending before the DDL, so a crash in between has to
+      // leave a safe re-run.
+      expect(statement).toContain('IF EXISTS')
+      expect(statement).not.toMatch(/DROP\s+TABLE/iu)
+    }
+  })
+
+  it('0029 drops exactly the ten hour tables, and nothing of the day or quarter grain', async () => {
+    // v0.8.0. Where 0027 had to keep every table, this one exists to remove
+    // them -- which makes the list the thing to pin: one name too many here is
+    // a `_1d` or `_15m` table the dashboard reads, gone with its rows.
+    const file = (await migrationFiles()).find(
+      (entry) => entry.name === '0029_drop_hour_tables.sql',
+    )
+    expect(file).toBeDefined()
+    const statements = splitStatements((file as { sql: string }).sql)
+    expect(statements).toEqual([
+      'DROP TABLE IF EXISTS metrics_1h',
+      'DROP TABLE IF EXISTS pages_1h',
+      'DROP TABLE IF EXISTS sources_1h',
+      'DROP TABLE IF EXISTS geography_1h',
+      'DROP TABLE IF EXISTS devices_1h',
+      'DROP TABLE IF EXISTS custom_events_1h',
+      'DROP TABLE IF EXISTS performance_1h',
+      'DROP TABLE IF EXISTS custom_event_samples_1h',
+      'DROP TABLE IF EXISTS session_rollups_1h',
+      'DROP TABLE IF EXISTS revenue_1h',
+    ])
+    for (const statement of statements) {
+      expect(statement).toMatch(/_1h$/u)
+      expect(statement).not.toMatch(/_1d\b|_15m\b/u)
     }
   })
 })

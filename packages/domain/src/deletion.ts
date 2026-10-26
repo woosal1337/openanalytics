@@ -58,22 +58,14 @@ export const DELETION_CLICKHOUSE_TARGETS = [
   'events_raw',
   'performance_events',
   'metrics_1m',
-  'metrics_1h',
   'metrics_1d',
-  'pages_1h',
   'pages_1d',
-  'sources_1h',
   'sources_1d',
-  'geography_1h',
   'geography_1d',
-  'devices_1h',
   'devices_1d',
-  'custom_events_1h',
   'custom_events_1d',
-  'performance_1h',
   'performance_1d',
   'session_facts_versions',
-  'session_rollups_1h',
   'session_rollups_1d',
   // The imported aggregate family (ADR-0032, D2/D9; ClickHouse migration 0015).
   //
@@ -134,15 +126,7 @@ export const DELETION_CLICKHOUSE_TARGETS = [
   // nothing points at any more. The generation-swap design makes that worse than
   // it sounds, because nothing recomputes a bucket whose facts are gone: the
   // last stored generation would simply stand forever.
-  'revenue_1h',
   'revenue_1d',
-  // Preview and test-mode events (ADR-0034, D6/D9; ClickHouse migration 0020).
-  //
-  // Site-scoped like every other target, so the existing delete-by-site
-  // statement covers it unchanged. It is a target despite carrying a 7-day TTL:
-  // a deletion must not be left waiting on one, and "the rows expire eventually"
-  // is not an answer to "erase this customer's data now".
-  'events_preview',
   // What a custom-events row may say beyond a count (ADR-0038, D5/D8;
   // ClickHouse migration 0021).
   //
@@ -152,8 +136,38 @@ export const DELETION_CLICKHOUSE_TARGETS = [
   // it was derived from and nothing recomputes a bucket whose source events are
   // gone, so leaving them would leave a deleted site's last event path and last
   // property bag readable, per event name, from a table nothing else points at.
-  'custom_event_samples_1h',
   'custom_event_samples_1d',
+  // The fifteen-minute rollup family (ADR-0079, D1; ClickHouse migration 0025).
+  //
+  // Eight tables, one per additive family, each the 15m twin of a 1h target
+  // above with the same columns and the same site_id key, so the existing
+  // delete-by-site statement covers them unchanged. They are targets in their
+  // own right for the reason every rollup is: an aggregate outlives the raw
+  // rows it came from, and nothing recomputes a bucket whose events are gone.
+  // Listed as literals rather than derived from the 1h names, per this list's
+  // standing rule -- a derived name would silently stop being purged.
+  'metrics_15m',
+  'pages_15m',
+  'sources_15m',
+  'geography_15m',
+  'devices_15m',
+  'custom_events_15m',
+  'performance_15m',
+  'custom_event_samples_15m',
+  // The fifteen-minute grain of the two SWAP rollups (ADR-0079, step 2;
+  // ClickHouse migration 0026).
+  //
+  // The eight above are materialized views. These two the worker writes: the
+  // session finalizer and the revenue attribution job. That difference decides
+  // how they are filled and who is granted what, and decides nothing at all
+  // here -- both are site-keyed derived rows that outlive the facts they came
+  // from, so both are purge targets on exactly the argument their hour twins
+  // are. A deleted site whose `session_rollups_15m` survived would leave its
+  // session counts, and one whose `revenue_15m` survived would leave its
+  // revenue totals, readable at a finer grain than the hour tables that WERE
+  // purged. Listed as literals, per this list's standing rule.
+  'session_rollups_15m',
+  'revenue_15m',
 ] as const
 export type DeletionClickhouseTarget = (typeof DELETION_CLICKHOUSE_TARGETS)[number]
 
@@ -292,10 +306,9 @@ export const DELETION_POSTGRES_TARGETS = [
   // verified at `deleted: N`, and verification is what this registry is for
   // (ADR-0030, decision 4).
   //
-  // The preview *token* is deliberately not here and never will be: it is an
+  // The rule-preview *token* was deliberately never here: it was an
   // Ed25519-signed value with a 15-minute expiry, held in no table (ADR-0034,
-  // D6). There is nothing to purge, and a target that could only ever verify at
-  // zero would be a claim we had erased something we never stored.
+  // D6) — nothing to purge. The whole mechanism is gone now (ADR-0068).
   'event_definition_versions',
   'event_definitions',
   // The embeddable widget configuration (ADR-0045, D8; migration 0048).
@@ -415,7 +428,31 @@ export interface DeletionTargetName {
  *   purges the `oauth_grant` half by `user_id`, and the two never overlap
  *   because exactly one of those columns is set per row. ClickHouse stayed 35 —
  *   a credential event is a Postgres row and nothing else — Redis stayed 5, and
- *   the object store stayed 1.
+ *   the object store stayed 1;
+ * - ADR-0068 dropped `events_preview` (ClickHouse migration 0022) — 35 became
+ *   34, the first time the ClickHouse set has ever shrunk;
+ * - ADR-0079 added the eight `*_15m` rollups (ClickHouse migration 0025) — 34
+ *   became **42**. One 15m twin per additive 1h family and nothing else: the
+ *   session and revenue rollups are finalizer swap targets rather than views
+ *   and get their fifteen-minute grain in a later step, and the read path does
+ *   not change here, so no Postgres row, Redis key or object moved with it;
+ * - ADR-0079's second step added that later grain — `session_rollups_15m` and
+ *   `revenue_15m` (ClickHouse migration 0026) — so 42 became **44**, and the
+ *   site total 70 became **72** (71 became **73** on hosted). Two tables, no
+ *   view: the worker writes them, which is why they needed an `oa_ingest`
+ *   grant and a container recreate that the eight views did not, and why their
+ *   history is backfilled rather than materialized. As purge targets they are
+ *   indistinguishable from their hour twins, which is the only thing this list
+ *   cares about;
+ * - ClickHouse migration 0029 (v0.8.0) dropped the ten hour tables — the eight
+ *   `*_1h` view targets, `session_rollups_1h` and `revenue_1h` — so 44
+ *   became **34** and the site total 72 became **62** (73 became **63** on
+ *   hosted), the second time the ClickHouse set has shrunk. Nothing had
+ *   written them since 0027 (ADR-0079 step 4), and the one thing that still
+ *   read them, the 15m backfill's equality gate, compares with `events_raw`
+ *   now. They leave this list in the same release that drops them: a target
+ *   naming a table that no longer exists would fail every deletion, and a
+ *   dropped table listed a release late would leave nothing to purge anyway.
  *
  * `currency_rates` (migration 0034) is deliberately **not** here and never will
  * be. It is global reference data — one row per `(rate_date, currency)`, with no

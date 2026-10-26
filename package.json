@@ -1,6 +1,6 @@
 {
   "name": "openanalytics",
-  "version": "0.4.2",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
   "description": "Open Analytics — durable analytics ingest, control plane and read contracts.",
@@ -37,7 +37,8 @@
     "contracts:generate": "node scripts/generate-contracts.mjs",
     "contracts:check": "node scripts/generate-contracts.mjs --check",
     "contracts:smoke": "tsc -p tests/smoke/frontend-client/tsconfig.json",
-    "test": "vitest run --project unit --project contract --project tracker",
+    "test": "vitest run --project unit --project contract --project tracker --project web",
+    "test:web": "vitest run --project web",
     "test:unit": "vitest run --project unit",
     "test:contract": "vitest run --project contract",
     "test:tracker": "vitest run --project tracker",

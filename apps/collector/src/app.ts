@@ -43,13 +43,6 @@ export interface AppDeps {
    */
   readonly trackerConfigStore?: TrackerConfigStore
   /**
-   * `PREVIEW_TOKEN_VERIFY_KEY` (ADR-0034, D6). Absent, `?preview=` on the config
-   * endpoint is ignored and the published rule set is served — a preview that
-   * cannot be authenticated is served as no preview, never as an
-   * unauthenticated one.
-   */
-  readonly previewVerifyKey?: string | undefined
-  /**
    * The browser bundle, read from the image at boot. Absent, `/oa.js` is not
    * mounted at all — a 404 an operator can see, rather than an empty 200 that
    * every visitor's browser would then cache for an hour. Where Caddy fronts
@@ -92,8 +85,20 @@ export function createApp(deps: AppDeps) {
 
   const v1 = new Hono()
 
-  // GET  /v1/tracker/config     — public, ETag-cached tracker configuration (M4)
-  v1.route('/tracker', createTrackerConfigRoutes(deps.trackerConfigStore, deps.previewVerifyKey))
+  // GET  /v1/tracker/config     — public, ETag-cached tracker configuration (M4),
+  //                               recording where the tag was seen (ADR-0081 D2)
+  v1.route(
+    '/tracker',
+    createTrackerConfigRoutes(
+      deps.trackerConfigStore,
+      // The realtime cache travels with the ingest block, so a config-only
+      // deployment records nothing — which the site read reports as "not
+      // computed" rather than as "the tag has not loaded" (ADR-0081, D3).
+      deps.ingest
+        ? { cache: deps.ingest.realtime, logger: deps.logger, metrics: deps.ingest.metrics }
+        : undefined,
+    ),
+  )
 
   if (deps.ingest) {
     const limiter = createIngestLimiter({

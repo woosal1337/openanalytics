@@ -1,13 +1,22 @@
 import { Activity01Icon } from "hugeicons-react";
+import { AiReferralsCard } from "@/components/dashboard/ai-referrals-card";
+import { AwaitingEventsBadge } from "@/components/dashboard/awaiting-events";
 import { CustomEventsCard } from "@/components/dashboard/custom-events-card";
-import { DeviceCards } from "@/components/dashboard/device-cards";
 import { IntervalProvider } from "@/components/dashboard/interval-context";
 import { IntervalSelect } from "@/components/dashboard/interval-select";
 import { LocationsCard } from "@/components/dashboard/locations-card";
 import { OverviewChart } from "@/components/dashboard/overview-chart";
 import { OverviewStats } from "@/components/dashboard/overview-stats";
-import { RealtimeCard } from "@/components/dashboard/realtime-card";
+import { RefreshButton } from "@/components/dashboard/refresh-button";
+import {
+  OverviewLiveBadge,
+  RealtimeCard,
+} from "@/components/dashboard/realtime-card";
 import { RevenueCard } from "@/components/dashboard/revenue-card";
+import { ShareOverviewButton } from "@/components/dashboard/share-overview-button";
+import { HeaderTimezonePill } from "@/components/dashboard/timezone-pill";
+import { SourcesProvider } from "@/components/dashboard/sources-resource";
+import { TechCard } from "@/components/dashboard/tech-card";
 import { TopPagesCard } from "@/components/dashboard/top-pages-card";
 import { TopSourcesCard } from "@/components/dashboard/top-sources-card";
 import { WebVitalsCard } from "@/components/dashboard/web-vitals-card";
@@ -24,10 +33,41 @@ export default async function OverviewPage({
   const { site } = await params;
   return (
     <IntervalProvider>
+    {/* The screen's clock, worn in the dashboard header beside the site
+        switcher: it is painted into the header's slot from inside this
+        provider, so the pick reaches every panel below. Only this screen
+        paints one. It shows the site's own zone by default, and changing it
+        changes this visit, never the site. */}
+    <HeaderTimezonePill />
     <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between gap-4">
-        <h1 className="text-xl font-medium tracking-tight">Overview</h1>
-        <IntervalSelect />
+        {/* Baseline group, not items-center: the badge is text against the
+            heading's text, and mixed sizes only look level when they share a
+            baseline. Fed by the Realtime card's own stream through a module
+            store, so the heading never opens a second SSE connection. */}
+        <div className="flex min-w-0 items-center gap-3">
+          <div className="flex items-baseline gap-2.5">
+            <h1 className="text-xl font-medium tracking-tight">Overview</h1>
+            <OverviewLiveBadge />
+          </div>
+          {/* Outside the baseline group: a bordered control against text
+              only looks level when it is centred, not baselined. */}
+          <RefreshButton />
+
+          {/* A site that has never received an event says so here rather than
+              in a strip above the cards: the state is usually over within a
+              minute, and it should not move the whole board while it lasts. */}
+          <AwaitingEventsBadge />
+        </div>
+        {/* The active filters ride the tab bar's own tray (its filter face),
+            which is the one piece of chrome on every screen and the only one
+            with nothing else to be beside. The interval picker stays here,
+            because the window and the filter are different kinds of
+            statement and only the filter has marks. */}
+        <div className="flex items-center gap-2">
+          <ShareOverviewButton />
+          <IntervalSelect />
+        </div>
       </div>
 
       <OverviewStats />
@@ -48,7 +88,9 @@ export default async function OverviewPage({
       {/* breakdown lists — 3x3; uniform h-60 panels sized for five rows.
           Every card brings its own SquircleCard now: "See all" opens the
           shared vertical modal with the full ranking, which needs card
-          state a server component cannot hold. */}
+          state a server component cannot hold. The sources read is fetched
+          once here and folded twice, by Sources and by AI referrals. */}
+      <SourcesProvider>
       <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
         <TopPagesCard />
 
@@ -65,7 +107,13 @@ export default async function OverviewPage({
             (Countries / Cities), which needs the card state */}
         <LocationsCard />
 
-        <DeviceCards />
+        {/* the visits AI assistants sent, cut from the shared sources read;
+            it took this slot from Devices on 2026-09-10 */}
+        <AiReferralsCard />
+
+        {/* brings its own SquircleCard: the header carries the cut picker
+            (Browsers / OS / Devices), which needs the card state */}
+        <TechCard />
 
         {/* realtime has a whole page — its "See all" is a door, not a modal */}
         <SquircleCard
@@ -82,6 +130,7 @@ export default async function OverviewPage({
             modal (M13), so the header needs a click handler, not a href */}
         <CustomEventsCard />
       </div>
+      </SourcesProvider>
     </div>
     </IntervalProvider>
   );

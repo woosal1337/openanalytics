@@ -91,6 +91,13 @@ export interface McpToolAnnotations {
 
 export interface McpToolDefinition {
   readonly name: string
+  /**
+   * Human-readable display name (MCP spec `2025-06-18`, `Tool.title`).
+   * Directory reviews (Anthropic's connector directory, ChatGPT's app review)
+   * require every tool to carry one; clients show it in consent prompts where
+   * `create_site` reads worse than "Create Site".
+   */
+  readonly title: string
   readonly description: string
   /**
    * The `/v1` path this tool dispatches into. A read tool names a `/read/*`
@@ -138,17 +145,70 @@ export function isReadOnlyTool(tool: McpToolDefinition): boolean {
   return tool.annotations?.readOnlyHint !== false
 }
 
-/** Read-only annotations, the default every existing tool carries. */
-const READ_ONLY: McpToolAnnotations = { readOnlyHint: true }
+/**
+ * Read-only annotations, the default every existing tool carries.
+ *
+ * All three hints are spelled out rather than left to a client's defaults.
+ * The spec says `destructiveHint` is only consulted when `readOnlyHint` is
+ * false, but ChatGPT's app review scans for the annotation itself and marks a
+ * tool that omits it as unannotated (2026-08-29), and a reviewer reading
+ * hints should never have to infer one from the absence of another.
+ */
+const READ_ONLY: McpToolAnnotations = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+}
 
 const RANGE_PARAMS = [
   { name: 'from', description: 'Range start, ISO-8601 UTC (inclusive).', required: true },
   { name: 'to', description: 'Range end, ISO-8601 UTC (exclusive).', required: true },
+  {
+    name: 'timezone',
+    description:
+      'Optional IANA timezone the days and weeks are cut on (for example Asia/Kolkata). ' +
+      "Defaults to the site's own reporting timezone, which is the zone its owner reads " +
+      'the dashboard in — send one only to answer a question about a different calendar. ' +
+      'A UTC offset such as +05:30 is refused; the answer names the zone it used in ' +
+      '`meta.timezone`.',
+    required: false,
+  },
 ] as const
 
 const LIMIT_PARAM = {
   name: 'limit',
   description: 'How many rows to return. Defaults to the API default.',
+  required: false,
+} as const
+
+/**
+ * The session-scoped filter set (ADR-0075, D-F1).
+ *
+ * Declared here so a model can ask the question the dashboard can ask, and
+ * declared with the GRAIN RULE IN ITS DESCRIPTION rather than a bare schema —
+ * because the rule is the part a model gets wrong. "Filter to sessions from
+ * google.com" and "filter to pageviews whose referrer was google.com" are
+ * different questions with different answers, and only the first one is what
+ * this parameter does. A model that assumes the second will misreport a
+ * customer's channel as bouncing.
+ *
+ * The value is a JSON string rather than a structured argument because every
+ * tool parameter here forwards into a query string; the api parses and refuses
+ * it in exactly one place, so a bad dimension comes back as a named
+ * `VALIDATION_FAILED` in the tool content — which is something a model can read
+ * and correct, rather than an empty result it would report as "no traffic".
+ */
+const FILTERS_PARAM = {
+  name: 'filters',
+  description:
+    'Optional session filter, as a JSON array of {dimension, operator, values}. ' +
+    'Dimensions: referrer_domain, country, city, device_type. Operators: eq, in. ' +
+    'Clauses combine with AND; values within one clause are OR. ' +
+    'It selects SESSIONS whose ENTRY carried the value and then reports everything ' +
+    'those sessions did — so a visit that arrived from youtube.com and read five ' +
+    'pages contributes all five, not just the landing one. ' +
+    'A filtered read covers at most 92 days and reads live data only. ' +
+    'Example: [{"dimension":"country","operator":"in","values":["US","CA"]}]',
   required: false,
 } as const
 
@@ -303,6 +363,7 @@ const EVENT_DEFINITION_CONTENT_PROPERTIES = {
 const mcpTools: McpToolDefinition[] = [
   {
     name: 'list_sites',
+    title: 'List Sites',
     description:
       'List the analytics sites this credential may read, with their slug, name, status and the caller’s role. Call this first: every other tool needs a site id from here.',
     path: '/read/sites',
@@ -312,55 +373,62 @@ const mcpTools: McpToolDefinition[] = [
   },
   {
     name: 'site_overview',
+    title: 'Site Overview',
     description:
       'Totals for one site over a date range — events, pageviews, billable events, visitors — with data-freshness metadata.',
     path: '/read/analytics/overview',
-    params: [...RANGE_PARAMS],
+    params: [...RANGE_PARAMS, FILTERS_PARAM],
     needsSite: true,
     scope: 'analytics:read',
   },
   {
     name: 'site_timeseries',
+    title: 'Site Timeseries',
     description: 'The same totals bucketed over time, for trends and comparisons.',
     path: '/read/analytics/timeseries',
-    params: [...RANGE_PARAMS],
+    params: [...RANGE_PARAMS, FILTERS_PARAM],
     needsSite: true,
     scope: 'analytics:read',
   },
   {
     name: 'top_pages',
+    title: 'Top Pages',
     description: 'The most-viewed pages on one site over a range.',
     path: '/read/analytics/pages',
-    params: [...RANGE_PARAMS, LIMIT_PARAM],
+    params: [...RANGE_PARAMS, LIMIT_PARAM, FILTERS_PARAM],
     needsSite: true,
     scope: 'analytics:read',
   },
   {
     name: 'top_sources',
+    title: 'Top Sources',
     description: 'Where a site’s traffic came from — referrers and campaigns.',
     path: '/read/analytics/sources',
-    params: [...RANGE_PARAMS, LIMIT_PARAM],
+    params: [...RANGE_PARAMS, LIMIT_PARAM, FILTERS_PARAM],
     needsSite: true,
     scope: 'analytics:read',
   },
   {
     name: 'geography',
+    title: 'Geography',
     description: 'Visitors by country and city.',
     path: '/read/analytics/geography',
-    params: [...RANGE_PARAMS, LIMIT_PARAM],
+    params: [...RANGE_PARAMS, LIMIT_PARAM, FILTERS_PARAM],
     needsSite: true,
     scope: 'analytics:read',
   },
   {
     name: 'devices',
+    title: 'Devices',
     description: 'Visitors by device, browser and operating system.',
     path: '/read/analytics/devices',
-    params: [...RANGE_PARAMS, LIMIT_PARAM],
+    params: [...RANGE_PARAMS, LIMIT_PARAM, FILTERS_PARAM],
     needsSite: true,
     scope: 'analytics:read',
   },
   {
     name: 'sessions',
+    title: 'Sessions',
     description:
       'Session counts and durations, with the finalizer watermark that says how much of the range can still be revised.',
     path: '/read/analytics/sessions',
@@ -370,6 +438,7 @@ const mcpTools: McpToolDefinition[] = [
   },
   {
     name: 'revenue_summary',
+    title: 'Revenue Summary',
     description:
       'Revenue totals for one site over a date range: gross charges, refunds, withdrawn and reinstated disputes, provider fees and net, plus charge, refund and dispute counts. Every amount is an integer in the minor unit of the site’s reporting currency (`totals.currency`) — 91000 in USD is $910.00, never divide before you have said which currency. Owner-only: any other role is refused with FORBIDDEN, which you must report rather than work around. Read `meta.revenue.connection_status` before calling a zero "no sales": `not_connected` means no payment provider was ever connected.',
     path: '/read/revenue/summary',
@@ -379,6 +448,7 @@ const mcpTools: McpToolDefinition[] = [
   },
   {
     name: 'revenue_timeseries',
+    title: 'Revenue Timeseries',
     description:
       'The same revenue measures bucketed over time, one point per hour or per day, for trends. Same currency, minor-unit and owner-only rules as revenue_summary, and the same `meta.revenue.connection_status` caveat. It returns no customer, order or transaction identifiers; individual transactions are not readable from any tool.',
     path: '/read/revenue/timeseries',
@@ -392,6 +462,7 @@ const mcpTools: McpToolDefinition[] = [
   // path token, not the `X-OA-Site` header.
   {
     name: 'site_install',
+    title: 'Install Snippet',
     description:
       'The tracking snippet and site key for one site — the public token that ships in page source. Read it to drop the tracker into a site’s HTML so it starts reporting. It is public by design; the private read key is never returned here.',
     path: '/read/site',
@@ -401,6 +472,7 @@ const mcpTools: McpToolDefinition[] = [
   },
   {
     name: 'team_members',
+    title: 'Team Members',
     description:
       'The members of one site’s team — user id, role and email address. Needs the team:read scope, which is named on the consent screen because it carries emails.',
     path: '/sites/{site_id}/members',
@@ -410,6 +482,7 @@ const mcpTools: McpToolDefinition[] = [
   },
   {
     name: 'list_funnels',
+    title: 'List Funnels',
     description:
       'The funnels defined on one site, for reading and analyzing their steps. Include archived ones with include_archived=true.',
     path: '/sites/{site_id}/funnels',
@@ -425,6 +498,7 @@ const mcpTools: McpToolDefinition[] = [
   },
   {
     name: 'list_event_definitions',
+    title: 'List Event Definitions',
     description:
       'The dashboard-defined custom events on one site — each with its name, status and currently published version number. Read this before writing a definition: the version number is what publish and rollback need to state which change they expect to replace. Include archived ones with include_archived=true.',
     path: '/sites/{site_id}/event-definitions',
@@ -441,6 +515,7 @@ const mcpTools: McpToolDefinition[] = [
   },
   {
     name: 'list_widgets',
+    title: 'List Widgets',
     description: 'The embeddable widgets configured on one site.',
     path: '/sites/{site_id}/widgets',
     params: [],
@@ -449,6 +524,7 @@ const mcpTools: McpToolDefinition[] = [
   },
   {
     name: 'share_settings',
+    title: 'Share Settings',
     description:
       'One site’s public-dashboard settings: which surfaces are shared and the current public link.',
     path: '/sites/{site_id}/public-dashboard',
@@ -461,6 +537,7 @@ const mcpTools: McpToolDefinition[] = [
   // not read-only prompts the human for confirmation before each of these.
   {
     name: 'create_site',
+    title: 'Create Site',
     description:
       'Create a new analytics site. Returns its id and its tracking key, so the snippet can be installed in the same flow. There is deliberately no domain field: a new site accepts events from any origin until its owner sets an origin allowlist, and that allowlist is a dashboard-only setting, never writable over MCP. Rename or restyle later with update_site.',
     path: '/sites',
@@ -481,6 +558,7 @@ const mcpTools: McpToolDefinition[] = [
   },
   {
     name: 'update_site',
+    title: 'Update Site',
     description:
       'Change a site’s name or reporting timezone. This tool cannot change the domain allowlist or any other setting — those are not writable over MCP.',
     path: '/sites/{site_id}',
@@ -500,6 +578,7 @@ const mcpTools: McpToolDefinition[] = [
   },
   {
     name: 'create_funnel',
+    title: 'Create Funnel',
     description:
       'Create a funnel on one site from an ordered list of page-path or event-name steps.',
     path: '/sites/{site_id}/funnels',
@@ -526,6 +605,7 @@ const mcpTools: McpToolDefinition[] = [
   },
   {
     name: 'update_funnel',
+    title: 'Update Funnel',
     description: 'Edit a funnel’s name, steps, scope or window.',
     path: '/sites/{site_id}/funnels/{funnel_id}',
     method: 'PATCH',
@@ -546,6 +626,7 @@ const mcpTools: McpToolDefinition[] = [
   },
   {
     name: 'archive_funnel',
+    title: 'Archive Funnel',
     description: 'Archive a funnel. Reversible — an archived funnel is hidden, not deleted.',
     path: '/sites/{site_id}/funnels/{funnel_id}',
     method: 'DELETE',
@@ -555,12 +636,12 @@ const mcpTools: McpToolDefinition[] = [
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
   },
   // Event definitions (ADR-0034; allowlist rows in `grant-arm.ts`). The four
-  // that ADR-0048 D3 named: create, draft, publish, rollback. Deliberately
-  // absent, because neither has an allowlist row: `DELETE` (archiving a
-  // definition stops its rules being served site-wide) and `preview` (which
-  // puts unpublished rules into a real browser on the customer's real site).
+  // that ADR-0048 D3 named: create, draft, publish, rollback. `DELETE` is
+  // deliberately absent, because it has no allowlist row: archiving a
+  // definition stops its rules being served site-wide.
   {
     name: 'create_event_definition',
+    title: 'Create Event Definition',
     description:
       'Define a new custom event on one site, with its first version’s content. The definition starts unpublished: nothing reaches a visitor’s browser until publish_event_definition names a version. The event name is permanent — it is the key every chart and funnel will refer to.',
     path: '/sites/{site_id}/event-definitions',
@@ -585,6 +666,7 @@ const mcpTools: McpToolDefinition[] = [
   },
   {
     name: 'draft_event_version',
+    title: 'Draft Event Version',
     description:
       'Save a new draft version of an existing event definition. The whole content is restated, not patched — a version is immutable and complete. A draft is in nobody’s browser until it is published, so this is the safe half of editing an event.',
     path: '/sites/{site_id}/event-definitions/{definition_id}/versions',
@@ -602,6 +684,7 @@ const mcpTools: McpToolDefinition[] = [
   },
   {
     name: 'publish_event_definition',
+    title: 'Publish Event Definition',
     description:
       'Make one version of an event definition live — from this call on, visitors’ browsers evaluate its rules. Reversible with rollback_event_definition, which is why publishing is on this surface at all. `expected_published_version` is not optional bookkeeping: state the version you read from list_event_definitions (or null if nothing is published yet), and a concurrent publish by someone else comes back as a conflict naming what is actually live instead of silently overwriting it.',
     path: '/sites/{site_id}/event-definitions/{definition_id}/publish',
@@ -626,6 +709,7 @@ const mcpTools: McpToolDefinition[] = [
   },
   {
     name: 'rollback_event_definition',
+    title: 'Rollback Event Definition',
     description:
       'Republish an older version’s content as a new version — the undo for publish_event_definition. It rewinds nothing: calling it twice produces two versions, and the response says which one is now live. Same `expected_published_version` rule as publishing.',
     path: '/sites/{site_id}/event-definitions/{definition_id}/rollback',
@@ -650,6 +734,7 @@ const mcpTools: McpToolDefinition[] = [
 
   {
     name: 'create_widget',
+    title: 'Create Widget',
     description: 'Create an embeddable widget on one site.',
     path: '/sites/{site_id}/widgets',
     method: 'POST',
@@ -666,6 +751,7 @@ const mcpTools: McpToolDefinition[] = [
   },
   {
     name: 'update_widget',
+    title: 'Update Widget',
     description:
       'Edit a widget, or enable/disable it. Disabling is the reversible way to take a widget down — there is no delete over MCP, because a widget id is never reissued.',
     path: '/sites/{site_id}/widgets/{widget_id}',
@@ -682,6 +768,7 @@ const mcpTools: McpToolDefinition[] = [
   },
   {
     name: 'update_share_settings',
+    title: 'Update Share Settings',
     description:
       'Change which surfaces a site’s public dashboard shows, and optionally rotate its public link. Rotating the link revokes the old one — the safe direction.',
     path: '/sites/{site_id}/public-dashboard',
@@ -824,6 +911,13 @@ export function buildToolRequest(input: {
   readonly args: Record<string, unknown>
   /** The api's own public origin — the URL the request is addressed to. */
   readonly resourceUrl: string
+  /**
+   * The site's own reporting timezone, for a ranged read whose caller named no
+   * zone (ADR-0079 D5). Resolved by the surface, which is where a database and
+   * a principal are; `undefined` falls back to `UTC`, which is what a caller
+   * that cannot resolve one gets rather than a refusal.
+   */
+  readonly siteTimezone?: string
   /** The caller's credential, copied verbatim under the header it arrived on. */
   readonly credential: {
     readonly header: 'authorization' | 'cookie'
@@ -849,11 +943,15 @@ export function buildToolRequest(input: {
     const value = args[param.name]
     if (typeof value === 'string' && value.length > 0) url.searchParams.set(param.name, value)
   }
-  // Every analytics read is UTC here. A model that wanted a local-calendar
-  // answer would have to say which zone, and inventing one from a token is how a
-  // report silently shifts by a day.
-  if (tool.params.some((param) => param.name === 'from')) {
-    url.searchParams.set('timezone', 'UTC')
+  // Every ranged read names a zone, because the read route requires one. The
+  // model's own `timezone` argument is already on the URL if it sent one — it is
+  // a declared parameter like any other — and what fills the gap otherwise is
+  // **the site's** reporting timezone (ADR-0079 D5): the calendar its owner
+  // reads the dashboard on, so "last week" means to a model what it means to
+  // them. `UTC` remains the floor for a caller that could not resolve one, which
+  // is a defined zone rather than one invented from a token.
+  if (tool.params.some((param) => param.name === 'from') && !url.searchParams.has('timezone')) {
+    url.searchParams.set('timezone', input.siteTimezone ?? 'UTC')
   }
 
   const headers = new Headers({ accept: 'application/json' })
@@ -919,6 +1017,15 @@ export interface McpRoutesDeps {
    * stops "is this token valid" from having two answers.
    */
   readonly verifyBearer: (token: string) => Promise<{ userId: string } | null>
+  /**
+   * The reporting timezone of a site **this caller is a member of**, or null.
+   *
+   * Injected for the same reason `verifyBearer` is: this file keeps no database.
+   * Membership-scoped rather than by id alone, so answering "which calendar does
+   * this tool read on" cannot become a way to ask about a site the caller may
+   * not read (ADR-0079 D5).
+   */
+  readonly siteTimezone: (params: { siteId: string; userId: string }) => Promise<string | null>
   readonly logger?: Logger
 }
 
@@ -999,6 +1106,18 @@ export function createMcpRoutes(deps: McpRoutesDeps): Hono<Env> {
       },
     )
 
+  // The transport is POST-only (no SSE stream, no sessions), which streamable
+  // HTTP permits; what it does not permit is a `404` for the other verbs on a
+  // URL that plainly exists. `405` plus `Allow` tells a probing client "right
+  // door, wrong verb" instead of "no such door". `GET` is the optional
+  // server-to-client stream, `DELETE` the optional session teardown; refusing
+  // both is within spec.
+  app.on(
+    ['GET', 'DELETE'],
+    '/mcp',
+    () => new Response(null, { status: 405, headers: { Allow: 'POST' } }),
+  )
+
   app.post('/mcp', async (c) => {
     const authorization = c.req.header('authorization')
     if (!authorization) return unauthorized()
@@ -1006,7 +1125,8 @@ export function createMcpRoutes(deps: McpRoutesDeps): Hono<Env> {
     // Verified before any method is answered — including `initialize` and
     // `tools/list`, which is where the first version let a dead token through.
     const bearer = /^Bearer (.+)$/iu.exec(authorization.trim())?.[1]
-    if (!bearer || !(await deps.verifyBearer(bearer))) return unauthorized()
+    const principal = bearer ? await deps.verifyBearer(bearer) : null
+    if (!principal) return unauthorized()
 
     let body: JsonRpcRequest
     try {
@@ -1044,12 +1164,16 @@ export function createMcpRoutes(deps: McpRoutesDeps): Hono<Env> {
         return reply({
           tools: MCP_TOOLS.map((tool) => ({
             name: tool.name,
+            title: tool.title,
             description: tool.description,
             inputSchema: inputSchema(tool),
             // A client reads the hints to decide whether to prompt for
             // confirmation (ADR-0048 D3). Read tools carry no `annotations`
-            // field and default to read-only here.
-            annotations: tool.annotations ?? READ_ONLY,
+            // field and default to read-only here. `openWorldHint` is stamped
+            // in one place because it is uniformly false: every tool
+            // dispatches into this same api, a closed system, and no tool
+            // reaches the open internet.
+            annotations: { openWorldHint: false, ...(tool.annotations ?? READ_ONLY) },
           })),
         })
 
@@ -1062,6 +1186,27 @@ export function createMcpRoutes(deps: McpRoutesDeps): Hono<Env> {
         const refusal = toolArgumentRefusal(tool, args)
         if (refusal !== null) return fail(JSON_RPC.invalidParams, refusal)
 
+        // The site's own clock, for a ranged tool whose caller named no zone
+        // (ADR-0079 D5). Read here rather than inside the builder because this
+        // is where a principal and a database are, and only for the tools that
+        // can use it — a listing takes no range and asks nothing.
+        //
+        // **Best-effort, and it has to be.** This resolves a presentational
+        // *default*; the read itself is fine without it, because `UTC` is a
+        // defined answer. A database hiccup here must therefore cost a caller
+        // the site's calendar and nothing else — turning a working analytics
+        // read into a 500 for the sake of a default would be a worse failure
+        // than the one it reports.
+        const siteId = args['site_id']
+        let siteTimezone: string | null = null
+        if (tool.params.some((param) => param.name === 'timezone') && typeof siteId === 'string') {
+          try {
+            siteTimezone = await deps.siteTimezone({ siteId, userId: principal.userId })
+          } catch (err) {
+            deps.logger?.warn('mcp_site_timezone_unresolved', { tool: tool.name, err })
+          }
+        }
+
         // **This is plan item 3.** Not a service call that resembles the route's
         // — the route itself, with its auth, its limiter, its membership check,
         // its scope check, its billing gate and its cost ledger. The `Request`
@@ -1073,6 +1218,7 @@ export function createMcpRoutes(deps: McpRoutesDeps): Hono<Env> {
             args,
             resourceUrl: deps.resourceUrl,
             credential: { header: 'authorization', value: authorization },
+            ...(siteTimezone === null ? {} : { siteTimezone }),
           }),
         )
         const text = await response.text()

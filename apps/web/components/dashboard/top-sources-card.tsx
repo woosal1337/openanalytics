@@ -8,19 +8,21 @@ import {
 } from "hugeicons-react";
 import { AnimatePresence, motion } from "motion/react";
 import * as React from "react";
+import { usePublishPosterSources } from "@/components/dashboard/poster-publishers";
 import { Favicon } from "@/components/dashboard/site-favicon";
 import {
   AnalyticsCardBody,
   breakdownShare,
   BreakdownRow,
-  useSiteAnalytics,
 } from "@/components/dashboard/analytics-card";
+import { useAnalyticsFilters } from "@/components/dashboard/filter-context";
 import { HoverList } from "@/components/dashboard/hover-list";
 import {
   SeeAllModal,
   SeeAllSkeleton,
   useIntervalLabel,
 } from "@/components/dashboard/see-all-modal";
+import { useSourcesResource } from "@/components/dashboard/sources-resource";
 import {
   DropdownMenu,
   DropdownMenuItem,
@@ -29,12 +31,7 @@ import {
   SquircleCard,
   SquircleCardScroll,
 } from "@/components/ui/squircle-card";
-import {
-  getAnalyticsSources,
-  type AnalyticsMeta,
-  type SourceRow,
-} from "@/lib/api";
-import { MOCK_SOURCES } from "@/lib/mock";
+import type { AnalyticsMeta, SourceRow } from "@/lib/api";
 import { resolveReferrer } from "@/lib/referrers";
 
 /**
@@ -47,7 +44,14 @@ import { resolveReferrer } from "@/lib/referrers";
  *
  * Folding sums visitor counts across tuples, so a visitor who arrived under
  * two campaigns of one source counts twice in that row — a small, deliberate
- * over-count; the views ranking underneath is exact.
+ * over-count. The rows are ranked by that visitors figure all the same,
+ * because it is the number the row shows: ranking by the exact views sum
+ * underneath read 27, 2, 27, 18 down the list (Abbas, 2026-09-10). Views
+ * stay on the row as the tie-break.
+ *
+ * The read itself is shared with the AI referrals card through
+ * `SourcesProvider` (sources-resource.tsx): both fold the same response,
+ * and the overview fetches it once.
  */
 
 const SPRING = { type: "spring", stiffness: 550, damping: 38 } as const;
@@ -84,6 +88,15 @@ export type FoldedRow = {
   direct: boolean;
   views: number;
   visitors: number;
+  /**
+   * The raw `referrer_domain` values this row folded together, and what a
+   * click filters by. The filter matches the canonical host exactly
+   * (ADR-0075), and folding is by display name, which can merge more than
+   * one host under one label; filtering by every host the row actually
+   * holds is the only way the filtered numbers describe the row that was
+   * clicked. Direct's raw value is the contract's own `""`.
+   */
+  raw: string[];
 };
 
 /** The referrer dimension: every row's domain, "" folding into Direct. */
@@ -100,12 +113,21 @@ export function foldReferrers(items: SourceRow[]): FoldedRow[] {
       direct: source === null,
       views: 0,
       visitors: 0,
+      raw: [],
     };
     bucket.views += row.views;
     bucket.visitors += row.visitors;
+    if (!bucket.raw.includes(row.referrer_domain)) {
+      bucket.raw.push(row.referrer_domain);
+    }
     byLabel.set(label, bucket);
   }
-  return [...byLabel.values()].sort((a, b) => b.views - a.views);
+  return [...byLabel.values()].sort(byVisitors);
+}
+
+/** Ranked by the shown number, views breaking ties (see the file comment). */
+function byVisitors(a: FoldedRow, b: FoldedRow): number {
+  return b.visitors - a.visitors || b.views - a.views;
 }
 
 /** One utm dimension: tagged rows only — untagged traffic is not "(none)",
@@ -124,12 +146,13 @@ function foldUtm(
       direct: false,
       views: 0,
       visitors: 0,
+      raw: [],
     };
     bucket.views += row.views;
     bucket.visitors += row.visitors;
     byLabel.set(value, bucket);
   }
-  return [...byLabel.values()].sort((a, b) => b.views - a.views);
+  return [...byLabel.values()].sort(byVisitors);
 }
 
 /** Favicon for a real referrer, the arrow for Direct, a target for utm. */
@@ -150,10 +173,30 @@ export function sourceMark(row: FoldedRow): React.ReactNode {
 }
 
 export function TopSourcesCard() {
-  const resource = useSiteAnalytics(getAnalyticsSources, MOCK_SOURCES);
+  const { enabled, active, addFilter, hasValue } = useAnalyticsFilters();
+  const resource = useSourcesResource();
   const [view, setView] = React.useState<SourceView>("referrers");
   const [open, setOpen] = React.useState(false);
   const current = VIEWS.find((entry) => entry.id === view) ?? VIEWS[0];
+
+  // The referrer fold for the share poster, whatever cut the header shows:
+  // the poster prints referrers, and the fold reads the same tuple list.
+  const posterRows = React.useMemo(
+    () =>
+      resource.status === "ready"
+        ? foldReferrers(resource.data.items).map((row) => ({
+            label: row.label,
+            domain: row.domain,
+            direct: row.direct,
+            visitors: row.visitors,
+          }))
+        : null,
+    [resource]
+  );
+  usePublishPosterSources(
+    posterRows,
+    resource.status === "ready" && resource.data.meta.truncated
+  );
 
   return (
     <>
@@ -197,7 +240,11 @@ export function TopSourcesCard() {
       }
     >
       <AnalyticsCardBody
-        emptyBody="No referrers in this range yet."
+        emptyBody={
+          active
+            ? "No visits match these filters."
+            : "No referrers in this range yet."
+        }
         isEmpty={(data) => data.items.length === 0}
         resource={resource}
       >
@@ -232,6 +279,25 @@ export function TopSourcesCard() {
                           icon={sourceMark(row)}
                           key={row.label}
                           name={row.label}
+                          // Referrers only: the utm cuts have no filter
+                          // dimension in v1, so their rows stay plain rows.
+                          onSelect={
+                            enabled &&
+                            view === "referrers" &&
+                            // Already filtered by every host this row folds:
+                            // the press would add nothing, so the row does not
+                            // offer one. Under a source filter this is most of
+                            // the rows left standing.
+                            !row.raw.every((domain) =>
+                              hasValue("referrer_domain", domain)
+                            )
+                              ? () => {
+                                  for (const domain of row.raw) {
+                                    addFilter("referrer_domain", domain);
+                                  }
+                                }
+                              : undefined
+                          }
                           pct={share(row.visitors)}
                           value={row.visitors.toLocaleString("en-US")}
                         />

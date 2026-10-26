@@ -48,6 +48,16 @@ import { createWebVitals, type ObserverHost } from './vitals.ts'
  */
 
 export interface TrackerRuntimeConfig {
+  /**
+   * The site's origin allowlist, mirrored from the config response (ADR-0081).
+   *
+   * The runtime does not branch on it — `browser.ts` does, because the check
+   * needs a `location` and this file is deliberately ignorant of one. It lives
+   * here so the value travels with every other piece of configuration, which is
+   * what makes it re-checked on each apply, including the re-fetch a SPA route
+   * change triggers (ADR-0034, D4). Empty means unconfigured: every host counts.
+   */
+  readonly allowedDomains: readonly string[]
   readonly redactQueryKeys: readonly string[]
   readonly interactionSampling: number
   readonly heartbeatIntervalSeconds: number
@@ -63,6 +73,18 @@ export interface TrackerRuntimeConfig {
    * have a browser sending the hint that would make it work.
    */
   readonly attributedRevenue: boolean
+  /**
+   * Nothing this page sends would be accepted, so it sends nothing.
+   *
+   * Three sources, all of them a refusal the tracker can see coming: a
+   * config-endpoint 404 — the site is deleted, or blocked by expiring the key
+   * (ADR-0074); the site's own `collection_paused`; and a host the site's
+   * allowlist excludes (ADR-0081, D1). `emit` is the single gate that honours
+   * it, so no signal path can quietly bypass it, and `flush` honours it too so
+   * that events stranded by an earlier page load are not carried to a door that
+   * is now closed.
+   */
+  readonly disabled: boolean
   readonly features: {
     readonly web_vitals: boolean
     readonly engagement: boolean
@@ -81,10 +103,12 @@ export type TrackerConfigPatch = Partial<Omit<TrackerRuntimeConfig, 'features'>>
 }
 
 export const DEFAULT_RUNTIME_CONFIG: TrackerRuntimeConfig = {
+  allowedDomains: [],
   redactQueryKeys: [],
   interactionSampling: 1,
   heartbeatIntervalSeconds: HEARTBEAT_INTERVAL_SECONDS,
   noCodeRules: [],
+  disabled: false,
   features: { web_vitals: true, engagement: true, interactions: true, heartbeat: true },
   // Off until the site's configuration says otherwise, which matters most on the
   // first page load — configuration arrives after the first pageview, so the
@@ -97,7 +121,6 @@ export interface TrackerOptions {
   readonly collectorUrl: string
   /** Defaults to the ambient window; injected in tests. */
   readonly window?: Window & typeof globalThis
-  readonly testMode?: boolean
   readonly debug?: boolean
   /**
    * `'none'` runs the tracker memory-only (ADR-0064, D5): nothing is written to
@@ -194,7 +217,6 @@ export function createTracker(options: TrackerOptions): Tracker {
   const context: TrackerContext = {
     sdk: TRACKER_SDK,
     sdk_version: TRACKER_VERSION,
-    ...(options.testMode === true ? { test_mode: true } : {}),
   }
 
   const transport = createTransport({
@@ -230,6 +252,10 @@ export function createTracker(options: TrackerOptions): Tracker {
     options_: { immediate?: boolean } = {},
   ): void => {
     if (!privacy.mayCollect()) return
+    // A gone site sends nothing at all — not to the network and not to the
+    // retry queue, where a refused event would only wait to be refused again.
+    // Guarded here for the same reason `mayCollect` is: one funnel, no bypass.
+    if (config.disabled) return
 
     // The site's attributed-revenue switch (ADR-0064 D4a), applied here rather
     // than at each caller for the same reason `mayCollect` is: one place to
@@ -435,7 +461,13 @@ export function createTracker(options: TrackerOptions): Tracker {
 
     if (config.features.web_vitals) vitals.report()
     collectEngagement()
-    transport.flush({ beacon: true })
+    // Both calls above go through `emit`, so a disabled tracker has buffered
+    // nothing — but the retry queue can still hold events from before it was
+    // disabled, and the unload flush would carry them to a door that is now
+    // known to be shut. "Sends nothing further" (ADR-0081 D1) has to mean the
+    // queue too, or a page on an excluded host ends its life with one last
+    // refused batch.
+    if (!config.disabled) transport.flush({ beacon: true })
   }
 
   const onPageHide = (): void => leave()
@@ -510,9 +542,19 @@ export function createTracker(options: TrackerOptions): Tracker {
         heartbeat.restart()
       }
       if (!config.features.heartbeat) heartbeat.stop()
+      // The heartbeat is the one signal that fires on a timer with no visitor
+      // action behind it; a disabled tracker stopping it is what turns "drops
+      // every event" into "does no periodic work either". The other signals go
+      // quiet through the `emit` gate. Not a full `stop()`: that tears down
+      // listeners this page could never re-arm, and the next page load skips
+      // installation entirely while the marker holds.
+      if (config.disabled) heartbeat.stop()
     },
 
     flush() {
+      // Same reasoning as the unload flush: the buffer is empty by the `emit`
+      // gate, and the retry queue must not be drained at a closed door either.
+      if (config.disabled) return
       transport.flush()
     },
 

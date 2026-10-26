@@ -77,7 +77,7 @@ part doing the work: a candidate publishes images under its own tag and sorts
 _above_ the release it is a candidate for, so `git tag --sort=-v:refname` lists
 `v0.1.0-rc.1` before `v0.1.0` and `git describe` would hand you the candidate.
 Dropping every tag with a `-` in it leaves only releases. To take a specific
-one, name it instead: `git checkout v0.4.2`.
+one, name it instead: `git checkout v0.8.0`.
 
 Add `--with-geoip` to that last command to download the country and city
 database in the same pass — see [GeoIP](#geoip). It is the one thing in the
@@ -116,7 +116,7 @@ because you checked out the tag before running it:
 > your version over the baked one, which still wins.
 
 ```sh
-grep OA_IMAGE .env                 # ghcr.io/openlabs-so/openanalytics, v0.4.2
+grep OA_IMAGE .env                 # ghcr.io/openlabs-so/openanalytics, v0.8.0
 docker compose pull
 docker compose up -d
 docker compose logs -f migrate     # schemas, both stores, from empty
@@ -171,7 +171,8 @@ minutes on that box, most of it compiling.
 Either way, the order is enforced by the compose file and is not cosmetic:
 
 1. stores start and become healthy;
-2. `migrate` runs Postgres migrations, then ClickHouse migrations, and exits;
+2. `migrate` runs Postgres migrations, then ClickHouse migrations, then fills
+   any rollup history that is missing (a no-op on an empty install), and exits;
 3. every application service waits for that exit — a failed migration stops the
    deploy instead of producing a fleet of services against a half-built schema;
 4. `tracker-build` compiles `oa.js` into a volume Caddy serves read-only;
@@ -292,8 +293,8 @@ Each service validates its own environment at startup, and **a service handed a
 secret it must not hold exits rather than starting**. That is the boundary the
 architecture rests on:
 
-- the internet-facing collector holds no ClickHouse credential, no Stripe key,
-  no mail credential and cannot mint the preview tokens it verifies;
+- the internet-facing collector holds no ClickHouse credential, no Stripe key
+  and no mail credential;
 - the query gateway holds the public verify key and never the private one, so it
   cannot forge the requests it exists to authenticate;
 - only the worker holds the credential that can delete analytics rows;
@@ -336,13 +337,12 @@ that should:
 | `ANONYMOUS_IDENTITY_SECRET` | `env/collector.env`, `env/worker.env` |
 | `OA_CREDENTIAL_KEYRING`     | `env/api.env`, `env/worker.env`       |
 
-### The three key pairs, and why they are not in an env file
+### The two key pairs, and why they are not in an env file
 
 | Pair            | Private half (api mints) | Public half (verifies only) |
 | --------------- | ------------------------ | --------------------------- |
 | Query signing   | api                      | query gateway               |
 | Realtime tokens | api                      | realtime                    |
-| Rule preview    | api                      | collector                   |
 
 ```sh
 openssl genpkey -algorithm ed25519 -out private.pem
@@ -489,12 +489,14 @@ its EULA forbids redistribution.
 database goes stale, and the collector opens it once at boot — a new file on
 disk changes nothing until the process restarts.
 
-**On a one-click platform there is no directory to fetch into.** Coolify and its
-peers write the rendered compose file and nothing beside it, so
-`docker-compose.coolify.yml` gives `/geoip` a named volume that starts empty and
-geo is null until you fill it. Two files could be baked into images and were;
-a licensed 125 MB database refreshed monthly could not. Fetch it wherever you
-have a shell and copy it in:
+**On a one-click platform the download is a step of the deploy.** Coolify and
+its peers write the rendered compose file and nothing beside it, so there is no
+directory to fetch into. `docker-compose.coolify.yml` and the Dokploy blueprint
+run a `geoip` one-shot instead: on the first deploy it fetches DB-IP City Lite
+into a named volume, and every later deploy leaves the file alone. A failed
+download fails that deploy on purpose, because the collector refuses to start
+on a path that names no file. To refresh the database, or to use your own
+MaxMind file, copy it into the volume and restart the collector:
 
 ```sh
 docker cp dbip-city-lite.mmdb <collector-container>:/geoip/
@@ -573,7 +575,6 @@ feature it has not enabled.
 | `OA_CREDENTIAL_KEYRING`                                                  | Revenue-connection routes that encrypt are not mounted (404); reading and disconnecting still work. Account → Deployment closes with `no_keyring`, because it would be storing secrets it cannot protect.              |
 | `CREDENTIAL_SOURCE_SECRET`                                               | No credential events are journalled at all. Reads are untouched.                                                                                                                                                       |
 | `OBJECT_STORAGE_*`                                                       | Data import and export are not mounted.                                                                                                                                                                                |
-| `PREVIEW_TOKEN_*`                                                        | Rule preview is unavailable; the published rule set is served instead. A preview that cannot be authenticated is served as no preview, never as an unauthenticated one.                                                |
 | `REALTIME_CACHE_REDIS_URL` on the gateway                                | Replay defence becomes per-process — correct only with a single gateway instance. It warns.                                                                                                                            |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_NOTIFY_CHAT_ID`                         | Notifications use the log transport.                                                                                                                                                                                   |
 | `METRICS_REMOTE_WRITE_*`                                                 | No metrics pipeline; the structured-log metrics floor remains.                                                                                                                                                         |
@@ -642,7 +643,7 @@ Two things worth knowing before you rely on any of it:
 
 ```sh
 git fetch --tags
-git checkout v0.4.2            # the release you are moving to
+git checkout v0.8.0            # the release you are moving to
 cd infra/selfhost
 ./upgrade.sh                   # tells you what it costs, then does it
 ```
@@ -662,6 +663,72 @@ the version being upgraded to. It works out the target from the tag you are
 standing on, takes a snapshot, points `.env` at the new images, pulls them and
 brings everything up. On an architecture with no published images,
 `./upgrade.sh --from-source` builds instead.
+
+**0.7.0 → 0.8.0 asks nothing else of you either**, and it is short:
+
+- **The hourly rollup tables are dropped.** ClickHouse migration 0029 removes
+  the ten `*_1h` tables 0.7.0 stopped writing; nothing had read them since
+  0.7.0 moved every chart to the fifteen-minute rollups. Site deletion stops
+  naming them in the same release. The `*_1d` tables stay.
+- **The history fill checks itself against your raw events.** In 0.7.0 it
+  compared its sums with the frozen hourly tables, so an upgrade with the
+  worker still running could log one `history fill backfill-15m failed` with
+  `additive_mismatch` over history that was complete. It now compares with
+  `events_raw`, which every rollup is built from, so that line no longer
+  appears for that reason — when it does appear, the filled history really
+  disagrees with the raw events, and the report above it says where.
+- **Going back from 0.8.0 is a restore, not an image tag.** 0029 deletes the
+  hourly tables, so the 0.7.0 images would find tables missing. Use
+  `./rollback.sh` to the snapshot `./upgrade.sh` took, as below.
+
+**Skipping 0.7.0 (0.6.0 → 0.8.0) is supported and asks nothing extra.** The
+migrate container applies ClickHouse migrations 0025 through 0029 in one run
+and fills the fifteen-minute rollups from your raw events afterwards, so
+everything 0.7.0 describes below happens too — only the hourly tables are gone
+by the time the fill runs. That is safe because the fill reads `events_raw`
+and checks itself against `events_raw`; no step of it needs an hourly table.
+Read the 0.7.0 notes below for what the fill costs on a large install.
+
+**0.6.0 → 0.7.0 asks nothing else of you either, but it does more while it
+runs**, so it is worth knowing what you are watching:
+
+- **Every chart now reads fifteen-minute rollups instead of hourly ones.** That
+  is what lets a site report on any IANA timezone, including +05:30 and +05:45,
+  which 0.6.0 refused. ClickHouse migrations 0025–0028 add the new tables, stop
+  the hourly ones from being written (they stay as frozen history, and a later
+  release drops them) and add `backfill_ledger`.
+- **The migrate container fills the new tables from your history, by itself.**
+  After the migrations it runs three fills — the eight view-backed families,
+  the session rollups and the revenue rollups (the worker then re-rolls revenue
+  history a month per pass). Each fill writes only what is missing, a site's
+  quarter hour that has events and no rollup row, so it is safe on any state
+  and the next start writes nothing. It reads every raw event once, so on a
+  large install the migrate step takes noticeably longer than usual, once. A
+  fill that fails is logged as `oa-migrate: history fill … failed` and does
+  **not** stop the stack: the next `docker compose up -d` retries it. Each
+  fill that wrote something leaves a row you can read with
+  `docker compose run --rm migrate node packages/clickhouse/dist/cli.js ledger`.
+- **If the worker keeps running through the upgrade** — a platform redeploy, or
+  `docker compose pull && docker compose up -d` without `./upgrade.sh` — one
+  quarter hour can come out short: the one in which the new views were created
+  counts only the events that arrived after that moment. `./upgrade.sh`
+  stops everything first, so it does not have that. (0.7.0 could also log one
+  false `additive_mismatch` here; 0.8.0 no longer does.)
+- **ClickHouse gets new grants**, for the two rollups the worker writes itself.
+  They are rendered when its container is created, and the new image tag is
+  what recreates it, so `./upgrade.sh` and a platform redeploy deliver them
+  without a step of yours. If you run your own ClickHouse image, see the
+  recreate note below.
+- **Every site now has a reporting timezone.** Postgres migration 0046 gives
+  each site without one its owner's account timezone, or UTC, and makes the
+  column required. The dashboard, widgets, the share page and the MCP server
+  all read on it; a reader can switch their own view from the header.
+- **Disk:** the fifteen-minute tables hold up to four rows for every hourly
+  one. Measured on a real install they came to about a tenth of the size of
+  the raw events.
+
+Going back is `./rollback.sh` to the snapshot the upgrade took, as for any
+release.
 
 **There are no down migrations, and that is a decision rather than an omission.**
 A reverse migration is code that runs once, in an emergency, having never been
@@ -720,6 +787,12 @@ services by hand:
   `infra/selfhost/clickhouse/oa-entrypoint.sh` and one of these recreates.
   Without it, inserts into the new table fail while ordinary traffic keeps
   flowing — the quiet half of the failure.
+- **Schema migrations are fatal, history fills are not.** The `migrate`
+  container stops the stack if a migration fails, because nothing may run
+  against a schema it was not built for. The history fills that follow them
+  only log a failure, because stopping the stack there would stop the
+  collector too, and every event sent meanwhile would be lost for the sake of
+  a report that the next start completes.
 
 ### The tracker
 
@@ -847,12 +920,33 @@ draining — usually a ClickHouse credential or a missing grant on a new table.
 `oa_maintenance` user must exist in ClickHouse — which needs a container
 recreate, not a restart.
 
+**Every country is Unknown, with a database loaded.** The collector logs
+`geoip_loaded` or `geoip_not_configured` when it starts. If it loaded one and
+still stores no country, look at the address it is handed: it looks up whatever
+the proxy asserts in `X-Real-IP`, and a private address has no country. The
+usual cause is IPv6. Docker forwards an IPv4 connection to a published port
+with iptables, which keeps the visitor's address, but an IPv6 connection goes
+through Docker's userland proxy and the container sees the bridge gateway
+instead (`172.28.0.1` with this compose's default subnet, `172.18.0.1` on
+Coolify). Every visitor on an IPv6 network then arrives as that one address.
+Either drop the domain's `AAAA` records so everything arrives over IPv4, or
+give the Docker network IPv6 as
+[Docker's guide](https://docs.docker.com/engine/daemon/ipv6/) describes. A
+visit from your own LAN or through a VPN is a private address too, and not a
+bug. A proxy or CDN in front of Caddy hands over its own address instead; see
+[Putting your own proxy in front](#putting-your-own-proxy-in-front).
+
 ---
 
 ## License
 
 AGPL-3.0. If you run a modified OpenAnalytics as a network service, the license
 requires you to offer your modified source to its users.
+
+One exception: the browser tracker — everything under `apps/tracker/`, and the
+`oa.js` it builds — is [MIT](apps/tracker/LICENSE). It is the file your visitors
+download and the only part of the product that runs on your pages, so it carries
+no copyleft. The bundle says so on its first line.
 
 The "OpenAnalytics" name and the `getopen.so` domain identify the hosted service
 run by its operators and are **not** part of the license grant. Self-hosted

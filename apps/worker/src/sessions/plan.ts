@@ -42,7 +42,7 @@ import type {
  * the next window, where it recomputes byte-identical and writes nothing.
  */
 
-const MS_PER_HOUR = 3_600_000
+const MS_PER_QUARTER_HOUR = 900_000
 const MS_PER_DAY = 86_400_000
 
 /** A ClickHouse `DateTime64(3, 'UTC')` literal from epoch ms: `YYYY-MM-DD HH:MM:SS.mmm`. */
@@ -55,9 +55,17 @@ export function chDateTime(ms: number): string {
   return new Date(ms).toISOString().replace('T', ' ').replace('Z', '').slice(0, 19)
 }
 
-/** UTC start-of-hour, in epoch ms. Matches ClickHouse `toStartOfHour` on a UTC column. */
-export function hourBucketMs(ms: number): number {
-  return Math.floor(ms / MS_PER_HOUR) * MS_PER_HOUR
+/**
+ * UTC start-of-quarter-hour, in epoch ms. Matches ClickHouse
+ * `toStartOfFifteenMinutes` on a UTC column (ADR-0079, D1).
+ *
+ * The epoch is on a quarter-hour boundary and every quarter is the same width,
+ * so flooring the millisecond count is exactly what ClickHouse does — the same
+ * argument `dayBucketMs` relies on, and the reason neither needs a timezone
+ * database.
+ */
+export function quarterBucketMs(ms: number): number {
+  return Math.floor(ms / MS_PER_QUARTER_HOUR) * MS_PER_QUARTER_HOUR
 }
 
 /** UTC start-of-day, in epoch ms. Matches ClickHouse `toStartOfDay` on a UTC column. */
@@ -73,6 +81,19 @@ interface FactFingerprint {
   readonly userId: string
   readonly anonymousId: string
   readonly sessionHint: string
+  /**
+   * Migration 0023. In the fingerprint for the same reason every other column
+   * is: a field the table has but the comparison does not is a field that never
+   * fills for a session that already exists.
+   *
+   * Unlike `city` this one DOES re-version pre-migration rows, and that is
+   * correct rather than a cost to avoid: `[]` is not the hint list of a session
+   * that had hints, it is the absence of a column, and such a row cannot be
+   * joined back to its events by a filtered read until it is rewritten. The
+   * blast radius is the finalizer's watermark — about 48.5 hours — and no
+   * further, because nothing below it is ever read again.
+   */
+  readonly sessionHints: string
   readonly midnightBridged: number
   readonly pageviews: number
   readonly engaged: number
@@ -110,6 +131,15 @@ interface FactFingerprint {
   readonly browser: string
   readonly os: string
   readonly country: string
+  /**
+   * ADR-0075 lane 0 / migration 0023, and it is in the comparison for the reason
+   * the block above gives about `utm_content`: a field the table has but the
+   * fingerprint does not is a column that never fills for a session that already
+   * exists. A session whose only change is that we now know its city would
+   * compare equal on everything else and never get a new version, and the column
+   * would stay empty on exactly the rows it was added for.
+   */
+  readonly city: string
   readonly finalized: number
 }
 
@@ -121,6 +151,10 @@ function fingerprintOfSession(session: CanonicalSession, finalized: number): Fac
     userId: session.userId,
     anonymousId: session.anonymousId,
     sessionHint: session.sessionHint,
+    // Compared as a joined string rather than element-wise: both sides are
+    // already sorted and deduplicated, so equal contents give equal text, and a
+    // scalar keeps `fingerprintsEqual` a flat list of `===` comparisons.
+    sessionHints: session.sessionHints.join('\u0000'),
     midnightBridged: session.midnightBridged ? 1 : 0,
     pageviews: session.pageviews,
     engaged: session.engaged ? 1 : 0,
@@ -138,6 +172,7 @@ function fingerprintOfSession(session: CanonicalSession, finalized: number): Fac
     browser: session.browser,
     os: session.os,
     country: session.country,
+    city: session.city,
     finalized,
   }
 }
@@ -150,6 +185,7 @@ function fingerprintOfStored(stored: StoredSessionFact): FactFingerprint {
     userId: stored.userId,
     anonymousId: stored.anonymousId,
     sessionHint: stored.sessionHint,
+    sessionHints: [...stored.sessionHints].sort().join('\u0000'),
     midnightBridged: stored.midnightBridged,
     pageviews: stored.pageviews,
     engaged: stored.engaged,
@@ -167,6 +203,7 @@ function fingerprintOfStored(stored: StoredSessionFact): FactFingerprint {
     browser: stored.browser,
     os: stored.os,
     country: stored.country,
+    city: stored.city,
     finalized: stored.finalized,
   }
 }
@@ -179,6 +216,7 @@ function fingerprintsEqual(a: FactFingerprint, b: FactFingerprint): boolean {
     a.userId === b.userId &&
     a.anonymousId === b.anonymousId &&
     a.sessionHint === b.sessionHint &&
+    a.sessionHints === b.sessionHints &&
     a.midnightBridged === b.midnightBridged &&
     a.pageviews === b.pageviews &&
     a.engaged === b.engaged &&
@@ -196,6 +234,7 @@ function fingerprintsEqual(a: FactFingerprint, b: FactFingerprint): boolean {
     a.browser === b.browser &&
     a.os === b.os &&
     a.country === b.country &&
+    a.city === b.city &&
     a.finalized === b.finalized
   )
 }
@@ -213,6 +252,7 @@ function sessionToFactRow(
     user_id: session.userId,
     anonymous_id: session.anonymousId,
     session_hint: session.sessionHint,
+    session_hints: session.sessionHints,
     midnight_bridged: session.midnightBridged ? 1 : 0,
     session_start: chDateTime64(session.startMs),
     session_end: chDateTime64(session.endMs),
@@ -232,6 +272,7 @@ function sessionToFactRow(
     browser: session.browser,
     os: session.os,
     country: session.country,
+    city: session.city,
     finalized: fields.finalized,
     retracted: 0,
     computed_at: chDateTime64(fields.computedAtMs),
@@ -258,6 +299,7 @@ function storedToTombstoneRow(
     user_id: stored.userId,
     anonymous_id: stored.anonymousId,
     session_hint: stored.sessionHint,
+    session_hints: stored.sessionHints,
     midnight_bridged: stored.midnightBridged,
     session_start: chDateTime64(stored.startMs),
     session_end: chDateTime64(stored.endMs),
@@ -277,6 +319,7 @@ function storedToTombstoneRow(
     browser: stored.browser,
     os: stored.os,
     country: stored.country,
+    city: stored.city,
     finalized: stored.finalized,
     retracted: 1,
     computed_at: chDateTime64(fields.computedAtMs),
@@ -288,6 +331,31 @@ export interface SessionFactsPlanInput {
   readonly recomputed: readonly CanonicalSession[]
   readonly stored: readonly StoredSessionFact[]
   readonly nowMs: number
+  /**
+   * The instant the caller has actually READ events up to, when that is earlier
+   * than `nowMs`. Defaults to `nowMs`.
+   *
+   * The two were the same value until the finalizer gained a row cap
+   * (2026-08-24), and conflating them is now the difference between a backlog
+   * that drains and one that never moves again.
+   *
+   * `nowMs` and this answer different questions. `nowMs` says how much of the
+   * recent past may still be INCOMPLETE IN STORAGE: an event may arrive up to
+   * `latenessMs` after it occurred, so nothing newer than `nowMs - latenessMs`
+   * can be treated as settled. This says how much of storage the caller
+   * actually LOOKED AT. A capped read stops early over data that is already
+   * durable and already complete — the rows are sitting in ClickHouse, they
+   * were simply not fetched — so the lateness allowance does not apply to them
+   * a second time.
+   *
+   * Charging both would stall the finalizer outright. Lateness is 24 hours and
+   * a 200,000-row window on the site that caused the cap to exist spans about
+   * seven, so a horizon of `readThroughMs - inactivity - lateness` lands BEFORE
+   * the watermark the run started from, the watermark cannot advance, and the
+   * next run reads the same rows forever — the same non-terminating loop as the
+   * out-of-memory one, minus the crash that made it visible.
+   */
+  readonly readThroughMs?: number
   readonly inactivityMs: number
   readonly latenessMs: number
   /**
@@ -309,8 +377,8 @@ export interface SessionFactsPlan {
   readonly version: number
   readonly changed: number
   readonly retracted: number
-  /** UTC hour-bucket starts (epoch ms) touched by a written row. Sorted, unique. */
-  readonly affectedHourBucketsMs: readonly number[]
+  /** UTC quarter-hour-bucket starts (epoch ms) touched by a written row. Sorted, unique. */
+  readonly affectedQuarterBucketsMs: readonly number[]
   /** UTC day-bucket starts (epoch ms) touched by a written row. Sorted, unique. */
   readonly affectedDayBucketsMs: readonly number[]
   /**
@@ -327,7 +395,21 @@ export interface SessionFactsPlan {
  * Plan the fact writes for one recompute window. Pure.
  */
 export function planSessionFacts(input: SessionFactsPlanInput): SessionFactsPlan {
-  const horizonMs = input.nowMs - input.inactivityMs - input.latenessMs
+  // The latest instant everything before which is BOTH durable and read.
+  //
+  // `nowMs - latenessMs` is the storage-completeness bound; `readThroughMs` is
+  // the read bound. A session can only be judged closed when it is behind both,
+  // so the horizon is built on whichever is earlier.
+  //
+  // With `readThroughMs` defaulted to `nowMs` — every caller before the row cap,
+  // and every uncapped read after it — the min collapses to `nowMs - latenessMs`
+  // and this is arithmetically identical to what it replaced. The generalization
+  // costs nothing in the ordinary case, which is why it is the shape chosen.
+  const completeThroughMs = Math.min(
+    input.readThroughMs ?? input.nowMs,
+    input.nowMs - input.latenessMs,
+  )
+  const horizonMs = completeThroughMs - input.inactivityMs
   // A session capped at `SESSION_MAX_LENGTH_HOURS` (ADR-0018) has its end no later
   // than `start + cap`, so once its start predates this cap-horizon its end is
   // already ≤ horizonMs and it is finalized regardless of any late tail. Treating
@@ -342,7 +424,7 @@ export function planSessionFacts(input: SessionFactsPlanInput): SessionFactsPlan
   const capHorizonMs =
     input.sessionMaxLengthMs === undefined
       ? Number.NEGATIVE_INFINITY
-      : input.nowMs - input.sessionMaxLengthMs - input.inactivityMs - input.latenessMs
+      : completeThroughMs - input.sessionMaxLengthMs - input.inactivityMs
   const computedAtMs = input.nowMs
 
   const storedById = new Map<string, StoredSessionFact>()
@@ -355,7 +437,7 @@ export function planSessionFacts(input: SessionFactsPlanInput): SessionFactsPlan
 
   const recomputedIds = new Set<string>()
   const factRows: SessionFactRow[] = []
-  const hourBuckets = new Set<number>()
+  const quarterBuckets = new Set<number>()
   const dayBuckets = new Set<number>()
   let changed = 0
   let retracted = 0
@@ -380,7 +462,7 @@ export function planSessionFacts(input: SessionFactsPlanInput): SessionFactsPlan
     if (!isNew) continue
 
     factRows.push(sessionToFactRow(input.siteId, session, { version, finalized, computedAtMs }))
-    hourBuckets.add(hourBucketMs(session.startMs))
+    quarterBuckets.add(quarterBucketMs(session.startMs))
     dayBuckets.add(dayBucketMs(session.startMs))
     changed += 1
   }
@@ -389,7 +471,7 @@ export function planSessionFacts(input: SessionFactsPlanInput): SessionFactsPlan
     if (stored.retracted === 1) continue
     if (recomputedIds.has(stored.sessionId)) continue
     factRows.push(storedToTombstoneRow(input.siteId, stored, { version, computedAtMs }))
-    hourBuckets.add(hourBucketMs(stored.startMs))
+    quarterBuckets.add(quarterBucketMs(stored.startMs))
     dayBuckets.add(dayBucketMs(stored.startMs))
     retracted += 1
   }
@@ -430,7 +512,7 @@ export function planSessionFacts(input: SessionFactsPlanInput): SessionFactsPlan
     version,
     changed,
     retracted,
-    affectedHourBucketsMs: [...hourBuckets].sort((a, b) => a - b),
+    affectedQuarterBucketsMs: [...quarterBuckets].sort((a, b) => a - b),
     affectedDayBucketsMs: [...dayBuckets].sort((a, b) => a - b),
     finalizedThroughMs,
   }

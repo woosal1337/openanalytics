@@ -28,12 +28,12 @@ import type { Resolution } from '@openanalytics/contracts'
 
 const MS_PER_DAY = 86_400_000
 
-export type SnapUnit = 'minute' | 'hour' | 'day'
+export type SnapUnit = 'minute' | 'quarter' | 'day'
 
-/** Floors an ISO instant down to the start of its UTC minute/hour/day. */
+/** Floors an ISO instant down to the start of its UTC minute/quarter-hour/day. */
 export function floorToUtcBoundary(iso: string, unit: SnapUnit): string {
   const ms = Date.parse(iso)
-  const size = unit === 'minute' ? 60_000 : unit === 'hour' ? 3_600_000 : MS_PER_DAY
+  const size = unit === 'minute' ? 60_000 : unit === 'quarter' ? 900_000 : MS_PER_DAY
   return new Date(Math.floor(ms / size) * size).toISOString()
 }
 
@@ -56,7 +56,7 @@ export interface Unservable {
 
 const snapForRollup: Record<RollupResolution, SnapUnit> = {
   '1m': 'minute',
-  '1h': 'hour',
+  '15m': 'quarter',
   '1d': 'day',
 }
 
@@ -84,14 +84,16 @@ function timeseriesOperationFor(
   }
   if (sourceRollup === '1m') return 'analytics.timeseries_minute'
   if (sourceRollup === '1d') return 'analytics.timeseries_day_utc'
-  // '1h': either the hour chart or a composed local-day chart.
+  // '15m': either the hour chart or a composed local-day chart. The operation
+  // ids keep saying `_hour` because they name the grain they *answer at*, which
+  // ADR-0079 did not change — only the table underneath them moved.
   return composeDayFromHour ? 'analytics.timeseries_day' : 'analytics.timeseries_hour'
 }
 
 /**
  * Resolves a timeseries request. Uses the full minute/hour/day selector, so a
- * short "today" range gets the minute rollup and a sub-hour zone is served at
- * minute grain but refused at hour/day (never answered wrong).
+ * short "today" range gets the minute rollup and every other range composes from
+ * the fifteen-minute atom, in whatever zone the caller asked for (ADR-0079).
  *
  * `input.resolution` forces the grain instead (CP3). The forced path is a
  * separate domain function rather than a flag threaded through the automatic
@@ -151,11 +153,11 @@ export interface ResolvedAggregate {
  * no time bucketing and only exist at hour/day grain in the gateway registry.
  *
  * The rule mirrors the timezone logic in `chooseResolution` but without a minute
- * tier: a sub-hour zone is refused (its local-midnight boundaries never align to
- * a UTC hour, so no hour/day rollup can honour them); a whole-hour zone always
- * uses the hour rollup (only hour boundaries match its local midnight, and a
- * report over the hour rollup is correct at any length up to the hour cap); UTC
- * uses the day rollup once past the hour band and the hour rollup below it.
+ * tier: a non-UTC zone always uses the atom rollup (only its quarter-hour
+ * boundaries match a local midnight, and a report over the atom rollup is
+ * correct at any length up to the hour cap); UTC uses the day rollup once past
+ * the hour band and the atom rollup below it. A zone whose offset the atom
+ * cannot express is refused, the same refusal `chooseResolution` makes.
  *
  * `input.resolution` forces the source instead (CP3), and only `hour` or `day`
  * can be forced: those are the only two rollups these totals have. `minute`
@@ -186,12 +188,13 @@ export function resolveAggregate(
     }
   }
 
-  if (alignment === 'sub-hour') {
+  if (alignment === 'unservable') {
     return {
       servable: false,
       alignment,
       reason:
-        'a sub-hour timezone offset cannot be aligned to the hour/day rollups these totals read',
+        'a timezone offset that is not a multiple of fifteen minutes cannot be aligned to the ' +
+        'rollups these totals read',
     }
   }
 
@@ -255,11 +258,11 @@ export function resolveAggregate(
       reason: `range span ${spanDays.toFixed(1)}d exceeds the ${config.MAX_SPAN_HOUR_DAYS}d hour-rollup cap`,
     }
   }
-  const { effectiveFrom, effectiveTo } = snapRange(input.from, input.to, 'hour')
+  const { effectiveFrom, effectiveTo } = snapRange(input.from, input.to, 'quarter')
   return {
     servable: true,
     grain: 'hour',
-    sourceRollup: '1h',
+    sourceRollup: '15m',
     alignment,
     effectiveFrom,
     effectiveTo,
@@ -272,13 +275,16 @@ export function resolveAggregate(
  * the UTC unit the finalized/provisional split is aligned on (docs snapshot 02
  * §10, §15; plan Milestone 8 items 6-7).
  *
- * Session rollups exist only at 1h/1d, so unlike the metrics chart there is no
- * minute grain: a short "today" range is served at hour grain, and a sub-hour
- * timezone — which has no whole-hour bucket that could carry its local
- * boundaries, and no minute session rollup to fall back to — is refused. The
+ * Session rollups exist only at 15m/1d, so unlike the metrics chart there is no
+ * minute grain: a short "today" range is served at hour grain. The
  * grain/timezone decision is delegated to the shared `chooseResolution` and then
  * mapped: its minute tier folds into hour, its UTC-day tier reads the 1d layers,
- * and its non-UTC composed-day tier composes local days from the 1h layers.
+ * and its non-UTC composed-day tier composes local days from the 15m layers.
+ *
+ * Since ADR-0079 step 3 there is no zone-shaped refusal left here to make. A
+ * `chooseResolution` that refuses an offset the atom cannot express refuses it
+ * for this family too, through the `servable: false` branch above — one refusal,
+ * in one place, rather than a second copy of the rule with its own wording.
  */
 export interface ResolvedSession {
   readonly servable: true
@@ -304,17 +310,6 @@ export function resolveSession(
       alignment: decision.timezoneAlignment,
     }
   }
-  // No minute session rollup exists, so a sub-hour zone (served only at minute
-  // grain for the additive family) has no honest session answer.
-  if (decision.timezoneAlignment === 'sub-hour') {
-    return {
-      servable: false,
-      alignment: 'sub-hour',
-      reason:
-        'session metrics have no minute rollup, so a sub-hour timezone offset cannot be served; ' +
-        'use a UTC or whole-hour view',
-    }
-  }
 
   if (decision.sourceRollup === '1d') {
     // UTC day: read the 1d layers directly.
@@ -332,29 +327,30 @@ export function resolveSession(
   }
 
   if (decision.grain === 'day' && decision.composeDayFromHour) {
-    // Non-UTC local day: compose from the 1h layers, split on the UTC hour.
-    const { effectiveFrom, effectiveTo } = snapRange(input.from, input.to, 'hour')
+    // Non-UTC local day: compose from the 15m layers, split on the UTC
+    // quarter-hour.
+    const { effectiveFrom, effectiveTo } = snapRange(input.from, input.to, 'quarter')
     return {
       servable: true,
       grain: 'day',
       finalizedOperation: 'analytics.sessions_finalized_day_local',
       provisionalOperation: 'analytics.sessions_provisional_day_local',
-      splitUnit: 'hour',
+      splitUnit: 'quarter',
       withTimezone: true,
       effectiveFrom,
       effectiveTo,
     }
   }
 
-  // Minute or hour tier: session metrics are served at hour grain from the 1h
+  // Minute or hour tier: session metrics are served at hour grain from the 15m
   // layers (the finest session rollup).
-  const { effectiveFrom, effectiveTo } = snapRange(input.from, input.to, 'hour')
+  const { effectiveFrom, effectiveTo } = snapRange(input.from, input.to, 'quarter')
   return {
     servable: true,
     grain: 'hour',
     finalizedOperation: 'analytics.sessions_finalized_hour',
     provisionalOperation: 'analytics.sessions_provisional_hour',
-    splitUnit: 'hour',
+    splitUnit: 'quarter',
     withTimezone: true,
     effectiveFrom,
     effectiveTo,
@@ -396,9 +392,92 @@ export function customEventSamplesOperationFor(sourceRollup: RollupResolution): 
     : 'analytics.custom_event_samples_hour'
 }
 
+/**
+ * The entry/exit/bounce operation for a resolved aggregate grain (ADR-0075,
+ * D-E1).
+ *
+ * Its own function rather than a `REPORT_SLUGS` entry, for the reason
+ * `customEventSamplesOperationFor` gives above: it is not a report. It produces
+ * no rows a caller reads on their own, it decorates the pages report with four
+ * fields, and it takes neither the zone nor the import parameters the report
+ * family takes — an imported provider day has no session in it, so there is
+ * nothing on that side of the cutover for it to partition. It is therefore
+ * absent from `TIMEZONE_OPERATIONS` and from both import sets below, and the
+ * registry walk in `tests/unit/query-gateway-operations.test.ts` is what keeps
+ * that absence true rather than assumed.
+ */
+export function pageSessionsOperationFor(sourceRollup: RollupResolution): string {
+  return sourceRollup === '1d' ? 'analytics.page_sessions_day' : 'analytics.page_sessions_hour'
+}
+
 /** The overview operation ID for a resolved aggregate grain. */
 export function overviewOperationFor(sourceRollup: RollupResolution): string {
   return sourceRollup === '1d' ? 'analytics.overview_day' : 'analytics.overview_hour'
+}
+
+/**
+ * Longest range a filtered read may cover, in days (ADR-0075, D-F5).
+ *
+ * The gateway's filtered operations cap the same span in their own parameter
+ * schemas, and this is not a duplicate of that: the schema's refusal reaches a
+ * client as a generic operation-parameter failure, while a request that is
+ * refused HERE is refused by name, with the cap and the requested span in the
+ * error details, before any query is signed. The frontend has committed to
+ * building that screen, and it needs something to render.
+ */
+export const FILTERED_MAX_SPAN_DAYS = 92
+
+/**
+ * Every filtered operation the gateway registers.
+ *
+ * Written out rather than derived by string surgery alone, because the surgery
+ * is what decides whether a report is filterable at all: `custom_events` and
+ * `performance` have no filtered counterpart in v1, and mapping their ids by
+ * pattern would produce an operation name the gateway rejects as unknown —
+ * a 400 that says nothing, where the api should say "this report does not take
+ * a filter yet".
+ */
+const FILTERED_OPERATIONS: ReadonlySet<string> = new Set([
+  'analytics.filtered_overview_hour',
+  'analytics.filtered_overview_day',
+  'analytics.filtered_timeseries_minute',
+  'analytics.filtered_timeseries_hour',
+  'analytics.filtered_timeseries_day',
+  'analytics.filtered_timeseries_day_utc',
+  'analytics.filtered_timeseries_week',
+  'analytics.filtered_timeseries_week_utc',
+  'analytics.filtered_pages_hour',
+  'analytics.filtered_pages_day',
+  'analytics.filtered_sources_hour',
+  'analytics.filtered_sources_day',
+  'analytics.filtered_geography_hour',
+  'analytics.filtered_geography_day',
+  'analytics.filtered_devices_hour',
+  'analytics.filtered_devices_day',
+  'analytics.filtered_page_sessions_hour',
+  'analytics.filtered_page_sessions_day',
+])
+
+/** The reports a filter may be applied to in v1 (ADR-0075, D-F2). */
+export const FILTERABLE_REPORT_SLUGS: readonly ReportSlug[] = [
+  'pages',
+  'sources',
+  'geography',
+  'devices',
+]
+
+/**
+ * The filtered twin of an unfiltered operation, or `null` when it has none.
+ *
+ * The ids are parallel on purpose — `analytics.pages_hour` and
+ * `analytics.filtered_pages_hour` — so the grain decision is made ONCE, by the
+ * same resolver, and the filter only chooses which of two families answers it.
+ * A second grain selector for filtered reads is how the two would eventually
+ * disagree about what "today" means.
+ */
+export function filteredOperationFor(operation: string): string | null {
+  const candidate = operation.replace(/^analytics\./, 'analytics.filtered_')
+  return FILTERED_OPERATIONS.has(candidate) ? candidate : null
 }
 
 /**
@@ -535,6 +614,20 @@ export const TIMEZONE_OPERATIONS: ReadonlySet<string> = new Set([
   // bound to any of the three is a "bound unused parameter" rejection.
   'analytics.revenue_timeseries_hour',
   'analytics.revenue_timeseries_day_local',
+  // The filtered charts (ADR-0075). Only the four that bucket in local time:
+  // the two UTC variants take no zone, and the filtered breakdowns and totals
+  // have no bucket to label and no cutover to render, so a zone bound to any of
+  // them is a "bound unused parameter" rejection — the same rule, applied to a
+  // second family.
+  //
+  // `operationParamsFor` reads this set for the UNFILTERED operation id and the
+  // filtered read binds its own zone from the same answer, which is why both
+  // spellings of one grain must be listed together or a filtered hour chart
+  // would silently lose its timezone.
+  'analytics.filtered_timeseries_minute',
+  'analytics.filtered_timeseries_hour',
+  'analytics.filtered_timeseries_day',
+  'analytics.filtered_timeseries_week',
 ])
 
 /**
@@ -584,21 +677,18 @@ export function importedReportOperationFor(slug: ReportSlug): string | null {
  * (ADR-0033, D7; ClickHouse migration 0018). Milestone 12 Checkpoint 5.
  *
  * `resolveSession` again, and deliberately so: the revenue rollups have exactly
- * the session rollups' shape — 1h and 1d only, no minute grain, versioned
+ * the session rollups' shape — 15m and 1d only, no minute grain, versioned
  * generation swaps rather than an incremental view — so the grain decision is
- * the same decision. Three consequences follow, and each is the session rule
+ * the same decision. Two consequences follow, and each is the session rule
  * with money in it:
  *
- * - **A sub-hour timezone is refused.** There is no minute revenue rollup to
- *   fall back to, and a zone whose local midnight never lands on a UTC hour
- *   cannot be answered from hour buckets without misattributing the edge of
- *   every day. `RESOLUTION_NOT_AVAILABLE` rather than a plausible wrong total.
  * - **A minute-tier range is served at hour grain.** "Today" on a revenue chart
  *   is hourly, which is also the finest grain the money is meaningful at — a
  *   per-minute revenue series is noise around individual transactions, and the
  *   transactions list is the surface for those.
- * - **A non-UTC day is composed from the hour rollup**, so a DST 23/25-hour day
- *   sums the hours it actually had.
+ * - **A non-UTC day is composed from the atom rollup**, so a DST 23/25-hour day
+ *   sums the hours it actually had — in every zone, since ADR-0079 step 3 put
+ *   `revenue_15m` under the composition.
  *
  * The summary shares this resolver rather than having one of its own: a range
  * total is the same buckets without the `GROUP BY`, so a range the chart refuses
@@ -649,16 +739,6 @@ export function resolveRevenue(
     }
   }
 
-  if (decision.timezoneAlignment === 'sub-hour') {
-    return {
-      servable: false,
-      alignment: 'sub-hour',
-      reason:
-        'revenue has no minute rollup, so a sub-hour timezone offset cannot be served; ' +
-        'use a UTC or whole-hour view',
-    }
-  }
-
   if (decision.sourceRollup === '1d') {
     const { effectiveFrom, effectiveTo } = snapRange(input.from, input.to, 'day')
     return {
@@ -672,7 +752,7 @@ export function resolveRevenue(
     }
   }
 
-  const { effectiveFrom, effectiveTo } = snapRange(input.from, input.to, 'hour')
+  const { effectiveFrom, effectiveTo } = snapRange(input.from, input.to, 'quarter')
   if (decision.grain === 'day' && decision.composeDayFromHour) {
     return {
       servable: true,

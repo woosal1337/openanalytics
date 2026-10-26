@@ -7,7 +7,41 @@ export {
 } from './migrate.ts'
 
 export {
-  EVENTS_PREVIEW_TABLE,
+  BackfillRefusedError,
+  FIFTEEN_MINUTE_BUCKET,
+  FIFTEEN_MINUTE_ROLLUPS,
+  backfillFifteenMinuteRollups,
+  backfillStatement,
+  type BackfillFifteenMinuteOptions,
+  type BackfillFifteenMinuteResult,
+  type BackfillRawReading,
+  type BackfillRefusalReason,
+  type BackfillTableReport,
+  type BackfillWitness,
+  type FifteenMinuteRollupSpec,
+} from './backfill-15m.ts'
+
+export {
+  BACKFILL_LEDGER_NAMES,
+  BACKFILL_LEDGER_TABLE,
+  hasBackfillRecord,
+  openBackfillLedger,
+  readBackfillLedger,
+  recordBackfill,
+  type BackfillLedger,
+  type BackfillLedgerEntry,
+  type BackfillLedgerName,
+} from './backfill-ledger.ts'
+
+export {
+  SESSION_BACKFILL_GENERATION,
+  backfillSessionRollups15m,
+  type BackfillSessionRollupsOptions,
+  type BackfillSessionRollupsResult,
+  type BackfillSessionSiteReport,
+} from './backfill-sessions-15m.ts'
+
+export {
   EVENTS_RAW_TABLE,
   EVENT_SOURCE_ORIGINS,
   MAX_PROPERTIES_BYTES,
@@ -15,10 +49,8 @@ export {
   foldServerPayload,
   serializeProperties,
   toClickHouseDateTime64,
-  toEventsPreviewRow,
   toEventsRawRow,
   type EventSourceOrigin,
-  type EventsPreviewRow,
   type EventsRawRow,
   type ToEventsRawRowOptions,
 } from './events-raw.ts'
@@ -117,11 +149,13 @@ export {
 
 export {
   DEFAULT_REVENUE_ROLLUP_TIMEOUT_MS,
+  REVENUE_ROLLUP_15M_TABLE,
   REVENUE_ROLLUP_1D_TABLE,
-  REVENUE_ROLLUP_1H_TABLE,
   createRevenueRollupsStore,
   revenueRollupToken,
+  sitesMissingFifteenMinuteHistory,
   type RevenueBucketAggregate,
+  type RevenueFifteenMinuteCoverage,
   type RevenueBucketMeasures,
   type RevenueRollupRow,
   type RevenueRollupUnit,
@@ -132,9 +166,11 @@ export {
 
 export {
   DEFAULT_SESSION_REQUEST_TIMEOUT_MS,
+  FACT_ARGMAX_COLUMNS,
   SESSION_FACTS_TABLE,
+  SESSION_ROLLUP_15M_TABLE,
   SESSION_ROLLUP_1D_TABLE,
-  SESSION_ROLLUP_1H_TABLE,
+  SESSION_ROLLUP_BUCKET_FN,
   createSessionFactsStore,
   type RollupBucketAggregate,
   type SessionFactRow,
@@ -144,4 +180,5 @@ export {
   type SessionRollupUnit,
   type StoredRollupBucket,
   type StoredSessionFact,
+  type WindowEventsPage,
 } from './session-facts.ts'

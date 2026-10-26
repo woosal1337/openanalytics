@@ -27,6 +27,7 @@ import type {
   RevenueSummaryResponse,
   SiteInvite,
   SiteMember,
+  SiteListItem,
   SiteSummary,
 } from "@/lib/api";
 
@@ -37,15 +38,15 @@ import type {
  * flipping to live changes the data source, never the shapes.
  */
 
-export const MOCK_SITES: SiteSummary[] = [
+export const MOCK_SITES: SiteListItem[] = [
   {
     site_id: "019f8740-2b3c-7a10-9c1d-4e5f6a7b8c9d",
     slug: "openanalytics",
-    name: "openanalytics.io",
+    name: "getopen.so",
     status: "active",
     role: "owner",
     is_billing_owner: true,
-    domains: ["openanalytics.io"],
+    domains: ["getopen.so"],
     created_at: "2025-11-04T09:12:00.000Z",
     // Data has flowed: onboarding's "tracker installed" step is done.
     first_event_at: "2025-11-04T09:41:07.000Z",
@@ -54,9 +55,24 @@ export const MOCK_SITES: SiteSummary[] = [
     ingest_grace_until: null,
     retention_deadline: null,
     reporting_currency: "USD",
-    // The owner picked a reporting clock (ADR-0044). The other two mocks leave
-    // it null, which is the default and means "the viewer's own clock applies".
+    // Every site has a reporting clock (ADR-0044, required by ADR-0079 D5).
+    // This one's owner picked it; the two below carry the 'UTC' a site gets
+    // when nobody ever named one.
     reporting_timezone: "Europe/Istanbul",
+    // The card figures (ADR-0080). Set, not null: null would mean "could not be
+    // computed", which is a different card from one showing real numbers.
+    all_time: {
+      visitors: 48_213,
+      pageviews: 191_804,
+      // An owner with a provider connected — the only case that gets a figure.
+      revenue: { net_minor: 1_284_500, currency: "USD" },
+    },
+    sparkline: [
+      412, 508, 466, 613, 702, 688, 754, 810, 905, 862, 940, 1012, 1108, 1044,
+      1186, 1240, 1302, 1288, 1355, 1420, 1398, 1476, 1533, 1610, 1588, 1672,
+      1740, 1705, 1811, 1890, 1854, 1922, 2008, 2071, 2044, 2130, 2215, 2189,
+      2274, 1160,
+    ],
   },
   {
     site_id: "019f8740-2b3c-7a10-9c1d-4e5f6a7b8d01",
@@ -72,7 +88,17 @@ export const MOCK_SITES: SiteSummary[] = [
     ingest_grace_until: null,
     retention_deadline: null,
     reporting_currency: "USD",
-    reporting_timezone: null,
+    reporting_timezone: "UTC",
+    all_time: {
+      visitors: 6_104,
+      pageviews: 14_982,
+      // `admin`, not `owner`: `revenue:read` is an owner capability, so this
+      // caller gets no figure at all rather than a zero.
+      revenue: null,
+    },
+    // Younger than the window: the series starts at the site's first event,
+    // rather than padding 34 weeks of leading zeros nobody measured.
+    sparkline: [88, 142, 166, 201, 255, 0, 312, 340],
   },
   {
     site_id: "019f8740-2b3c-7a10-9c1d-4e5f6a7b8d02",
@@ -89,7 +115,11 @@ export const MOCK_SITES: SiteSummary[] = [
     ingest_grace_until: null,
     retention_deadline: null,
     reporting_currency: "USD",
-    reporting_timezone: null,
+    reporting_timezone: "UTC",
+    // Waiting for its first event. Zero is the measurement here — nothing has
+    // ever arrived — so the card says so instead of showing nothing.
+    all_time: { visitors: 0, pageviews: 0, revenue: null },
+    sparkline: [],
   },
 ];
 
@@ -243,11 +273,11 @@ const MOCK_ANALYTICS_META: AnalyticsMeta = {
 export const MOCK_PAGES: AnalyticsPagesResponse = {
   meta: MOCK_ANALYTICS_META,
   items: [
-    { page_path: "/", views: 7412, visitors: 3218 },
-    { page_path: "/pricing", views: 4102, visitors: 1874 },
-    { page_path: "/blog/why-we-left-ga", views: 2988, visitors: 1402 },
-    { page_path: "/docs", views: 2140, visitors: 986 },
-    { page_path: "/changelog", views: 1201, visitors: 512 },
+    { page_path: "/", views: 7412, visitors: 3218, entrances: 2894, exits: 1560, bounces: 1103, bounce_rate: 1103 / 2894 },
+    { page_path: "/pricing", views: 4102, visitors: 1874, entrances: 655, exits: 890, bounces: 214, bounce_rate: 214 / 655 },
+    { page_path: "/blog/why-we-left-ga", views: 2988, visitors: 1402, entrances: 1188, exits: 742, bounces: 561, bounce_rate: 561 / 1188 },
+    { page_path: "/docs", views: 2140, visitors: 986, entrances: 301, exits: 498, bounces: 74, bounce_rate: 74 / 301 },
+    { page_path: "/changelog", views: 1201, visitors: 512, entrances: 0, exits: 240, bounces: 0, bounce_rate: null },
   ],
 };
 
@@ -259,6 +289,14 @@ export const MOCK_SOURCES: AnalyticsSourcesResponse = {
     { referrer_domain: "news.ycombinator.com", utm_source: "", utm_medium: "", utm_campaign: "", views: 2911, visitors: 1345 },
     { referrer_domain: "x.com", utm_source: "", utm_medium: "", utm_campaign: "", views: 1984, visitors: 918 },
     { referrer_domain: "github.com", utm_source: "", utm_medium: "", utm_campaign: "", views: 1310, visitors: 604 },
+    // The assistants, for the AI referrals card. ChatGPT tags its links, and
+    // the referrer-less tuple below is a click from its apps: the AI card
+    // counts it, the Referrers cut files it under Direct.
+    { referrer_domain: "chatgpt.com", utm_source: "chatgpt.com", utm_medium: "", utm_campaign: "", views: 742, visitors: 356 },
+    { referrer_domain: "perplexity.ai", utm_source: "", utm_medium: "", utm_campaign: "", views: 288, visitors: 141 },
+    { referrer_domain: "", utm_source: "chatgpt.com", utm_medium: "", utm_campaign: "", views: 231, visitors: 118 },
+    { referrer_domain: "claude.ai", utm_source: "", utm_medium: "", utm_campaign: "", views: 173, visitors: 84 },
+    { referrer_domain: "gemini.google.com", utm_source: "", utm_medium: "", utm_campaign: "", views: 96, visitors: 45 },
   ],
 };
 

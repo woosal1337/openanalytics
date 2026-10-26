@@ -1,6 +1,9 @@
 import { ApiError, trackerConfigSchema, type TrackerConfig } from '@openanalytics/contracts'
-import { verifyPreviewToken } from '@openanalytics/auth'
+import { isOriginAllowed } from '@openanalytics/domain'
+import type { Logger, Metrics } from '@openanalytics/observability'
+import { TAG_SIGHTING_ORIGIN_ABSENT, type RealtimeCache } from '@openanalytics/redis'
 import { Hono } from 'hono'
+import { COLLECTOR_METRICS } from './metrics.ts'
 
 /**
  * `GET /v1/tracker/config` — the tracker's own configuration (docs snapshot 02
@@ -30,17 +33,6 @@ export interface TrackerConfigRecord {
 export interface TrackerConfigStore {
   /** Resolves a public tracking key. `null` when no live site matches. */
   find(trackingKey: string): Promise<TrackerConfigRecord | null>
-  /**
-   * Resolves the same key but serves one *unpublished* definition version's
-   * rules instead of the published set (ADR-0034, D6).
-   *
-   * `null` when the key does not resolve, or when the token names a site other
-   * than the one the key belongs to, or when that version does not exist.
-   */
-  findPreview?(
-    trackingKey: string,
-    preview: { definitionId: string; version: number; siteId: string },
-  ): Promise<TrackerConfigRecord | null>
 }
 
 /**
@@ -52,13 +44,31 @@ export interface TrackerConfigStore {
 export const TRACKER_CONFIG_CACHE_CONTROL = 'public, max-age=300, stale-while-revalidate=3600'
 
 export function etagFor(record: TrackerConfigRecord): string {
-  return `"oa-${record.siteId}-${record.config.config_version}"`
+  // The paused light is part of the tag (ADR-0074, amendment 2): the paused
+  // state moves without a `config_version` bump, and a body changing under a stable
+  // tag is precisely the stale-304 trap — a browser would revalidate its
+  // cached "paused" forever and never notice the window reopening.
+  const paused = record.config.collection_paused === true ? '-paused' : ''
+  return `"oa-${record.siteId}-${record.config.config_version}${paused}"`
+}
+
+/**
+ * Where the sighting a config fetch produces is written (ADR-0081, D2).
+ *
+ * Optional at the route, because the realtime cache is: a config-only
+ * deployment has no `ingest` block at all, and it answers configuration exactly
+ * as it does today while recording nothing. The dashboard reads the absence as
+ * "not computed", never as "the tag has not loaded" (D3).
+ */
+export interface TrackerConfigSightings {
+  readonly cache: Pick<RealtimeCache, 'recordTagSighting'>
+  readonly logger: Logger
+  readonly metrics: Metrics
 }
 
 export function createTrackerConfigRoutes(
   store: TrackerConfigStore | undefined,
-  /** `PREVIEW_TOKEN_VERIFY_KEY`. Absent, `?preview=` is ignored entirely. */
-  verifyKey?: string | undefined,
+  sightings?: TrackerConfigSightings,
 ) {
   const routes = new Hono()
 
@@ -78,35 +88,57 @@ export function createTrackerConfigRoutes(
       })
     }
 
-    // A preview request (ADR-0034, D6). The token is the only way an
-    // *unpublished* rule ever reaches a browser, so an unverifiable one is
-    // served as no preview at all rather than as an unauthenticated one: the
-    // request falls through to the published set below. Silently, and
-    // deliberately — an expired token during a preview session should show the
-    // user their live rules, not an error page on their own site.
-    const previewToken = c.req.query('preview')
-    if (previewToken !== undefined && previewToken !== '' && verifyKey && store.findPreview) {
-      const verified = verifyPreviewToken(previewToken, { verifyKey, now: new Date() })
-      if (verified.ok) {
-        const preview = await store.findPreview(key, {
-          definitionId: verified.claims.definition_id,
-          version: verified.claims.version,
-          siteId: verified.claims.site_id,
-        })
-        if (preview) {
-          // Never cached, at any layer. A preview is a temporary override of the
-          // site's real configuration, and one cached for even five minutes
-          // would outlive the session it belongs to and follow a real visitor
-          // around — the tracker's own localStorage copy included.
-          c.header('Cache-Control', 'no-store')
-          return c.json(trackerConfigSchema.parse(preview.config))
-        }
-      }
-    }
-
+    // `?preview=` is intentionally not read here. The rule-preview mechanism
+    // was retired by ADR-0068; a stale dashboard URL still carrying the
+    // parameter gets the published configuration like any other request.
     const record = await store.find(key)
     if (!record) {
       throw new ApiError('SITE_NOT_FOUND', 'No site matches this tracking key.')
+    }
+
+    if (sightings) {
+      const rawOrigin = c.req.header('origin')
+      // The gate's own function, on the gate's own input: `isOriginAllowed`
+      // reads a full origin (`https://host:3000`), so the raw header goes in
+      // rather than the `(none)` placeholder the hash field carries. A dashboard
+      // that computed this itself could disagree with the collector about
+      // whether an origin counts, which is the one thing this signal may not do
+      // (ADR-0081, D2).
+      const allowed = isOriginAllowed(rawOrigin, record.config.allowed_domains)
+
+      const failed = (error: unknown): void => {
+        sightings.logger.warn('tag_sighting_write_failed', {
+          err: error,
+          site_id: record.siteId,
+          retryable: true,
+        })
+        sightings.metrics.increment(COLLECTOR_METRICS.tagSightingFailed, {
+          site_id: record.siteId,
+        })
+      }
+
+      // Fire-and-forget on purpose, and before the `304` return so a tracker
+      // whose configuration has not changed is still seen: this is a
+      // diagnostic, and no part of it may delay or fail a config response.
+      //
+      // Both failure shapes are caught. The `.catch` covers a rejected write —
+      // an unreachable cache — and the `try` covers a client that throws
+      // synchronously before returning a promise at all, which is what an
+      // adapter missing this method looks like. Either one uncaught here would
+      // turn a tag sighting into a `500` on the endpoint every installed tracker
+      // in the world polls.
+      try {
+        void sightings.cache
+          .recordTagSighting({
+            siteId: record.siteId,
+            origin: (rawOrigin ?? '').toLowerCase() || TAG_SIGHTING_ORIGIN_ABSENT,
+            allowed,
+            at: new Date(),
+          })
+          .catch(failed)
+      } catch (error) {
+        failed(error)
+      }
     }
 
     const etag = etagFor(record)

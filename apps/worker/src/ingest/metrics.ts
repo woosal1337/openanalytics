@@ -48,6 +48,24 @@ export const WORKER_METRICS = {
   /** G-006 alert. A gauge: it falls again when the worker catches up. */
   queueOldestAgeMs: 'worker_queue_oldest_age_ms',
   queueTrimmed: 'worker_queue_trimmed',
+  /**
+   * Valkey's `used_memory` as a fraction of its `maxmemory`, for the queue
+   * instance. A gauge, and the only capacity series this repository publishes
+   * about either store.
+   *
+   * It exists because of what its absence cost. On 2026-08-22 the queue
+   * instance filled, `noeviction` turned every `XADD` into an error, and the
+   * collector returned 503 for twenty-five minutes; 9,831 events were lost. The
+   * alert-rules header said in as many words that "this repo publishes no disk,
+   * memory or connection counter" — accurately, and that was the outage.
+   *
+   * NOT zero-filled, unlike every backlog gauge in this file, and the
+   * difference is deliberate: `memoryUsageRatio` returns null for an instance
+   * with no `maxmemory`, where there is no ratio and zero would read as the
+   * healthiest possible value. Its rule's `noDataState` carries that case
+   * instead.
+   */
+  valkeyMemoryRatio: 'worker_valkey_memory_ratio',
 
   /** accepted_at → durable in ClickHouse. The plan's freshness criterion. */
   freshnessMs: 'worker_freshness_ms',
@@ -399,7 +417,15 @@ export const WORKER_METRICS = {
   sessionFactVersions: 'worker_session_fact_versions',
   /** Retraction tombstones written, a counter. */
   sessionFactRetractions: 'worker_session_fact_retractions',
-  /** Rollup buckets swapped to a higher generation, a counter. */
+  /**
+   * Rollup buckets swapped to a higher generation, a counter, **labelled by
+   * `unit`** exactly as `revenueRollupSwaps` is (ADR-0079 step 2).
+   *
+   * The label is what makes the fifteen-minute grain observable at all: an
+   * unlabelled total stays healthy on hour and day traffic alone, so a
+   * `session_rollups_15m` that never receives a row would look identical to one
+   * that does.
+   */
   sessionRollupSwaps: 'worker_session_rollup_swaps',
   /** Time spent in one site's recompute, a `_ms` counter beside `_runs`. */
   sessionFinalizeMs: 'worker_session_finalize_ms',

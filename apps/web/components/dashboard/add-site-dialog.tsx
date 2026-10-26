@@ -4,6 +4,7 @@ import { CheckmarkCircle02Icon, PlusSignIcon } from "hugeicons-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useRouter } from "next/navigation";
 import * as React from "react";
+import { cleanDomain } from "@/lib/site-domain";
 import { InstallOptions } from "@/components/dashboard/install-options";
 import { Favicon } from "@/components/dashboard/site-favicon";
 import { Logo } from "@/components/ui/logo";
@@ -19,6 +20,7 @@ import {
   type CreatedSite,
 } from "@/lib/api";
 import { MOCK_CREATED_SITE } from "@/lib/mock";
+import { browserTimezone } from "@/lib/timezone";
 
 const SPRING = { type: "spring", stiffness: 550, damping: 38 } as const;
 
@@ -50,20 +52,6 @@ export function slugify(value: string): string {
     .slice(0, 63);
 }
 
-/** A bare hostname with at least one dot — what the domains allowlist takes. */
-export function cleanDomain(value: string): string | null {
-  const bare = value
-    .trim()
-    .toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/\/.*$/, "")
-    .replace(/\.$/, "");
-  return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(
-    bare
-  )
-    ? bare
-    : null;
-}
 
 /**
  * Self-contained trigger + dialog, for the sites overview page.
@@ -116,15 +104,31 @@ export function AddSiteFlow({ onClose }: { onClose: () => void }) {
   // instead of holding one fixed frame — onboarding's measured-height
   // spring. Border box, not `contentRect`: the step carries padding, and
   // the content box alone would clip the last control away.
+  // `offsetHeight`, the `FlowDialog` fix carried here: the card enters
+  // through a `scale: 0.94 → 1` spring and a bounding rect measures the
+  // transformed box, so the first reading came in short and the panel
+  // visibly grew as the entrance played out.
   const [panelHeight, setPanelHeight] = React.useState<number | null>(null);
   const measureStep = React.useCallback((node: HTMLDivElement | null) => {
     if (!node) return;
     const observer = new ResizeObserver(() => {
-      setPanelHeight(node.getBoundingClientRect().height);
+      setPanelHeight(node.offsetHeight);
     });
     observer.observe(node);
     return () => observer.disconnect();
   }, []);
+  // The first measurement applies instantly; only step changes ride the
+  // spring. The observer's first value lands a frame after the modal is on
+  // screen at `height: auto`, and springing from that to the measured pixel
+  // value played out as the panel growing a beat after opening. `settled`
+  // flips one timer-hop after that first value, so the render carrying it
+  // still has the transition off.
+  const [settled, setSettled] = React.useState(false);
+  React.useEffect(() => {
+    if (panelHeight === null || settled) return;
+    const raise = setTimeout(() => setSettled(true), 0);
+    return () => clearTimeout(raise);
+  }, [panelHeight, settled]);
 
   React.useEffect(() => () => clearTimeout(timeout.current), []);
 
@@ -172,6 +176,25 @@ export function AddSiteFlow({ onClose }: { onClose: () => void }) {
           await sites.update(site.site_id, { domains: [bareDomain] });
         } catch {
           /* settings screen owns fixing the allowlist */
+        }
+
+        // The reporting timezone, defaulted to this browser's zone (ADR-0079
+        // D5). This dialog asks no timezone question — onboarding does, once —
+        // so the default is the honest guess rather than the null that used to
+        // make a new site's widgets report UTC's today. Settings → General is
+        // where it is changed.
+        //
+        // Its own PATCH, and that is the point: the server validates the zone
+        // against its own ICU, which can be older than this browser's, and one
+        // rejected id sent together with the domains took the allowlist down
+        // with it — leaving the site with an empty allowlist, which accepts
+        // *every* origin rather than none.
+        try {
+          await sites.update(site.site_id, {
+            reporting_timezone: browserTimezone(),
+          });
+        } catch {
+          /* the site keeps the null zone it was created with */
         }
         setBusy(false);
         setCreated(site);
@@ -298,7 +321,7 @@ export function AddSiteFlow({ onClose }: { onClose: () => void }) {
               animate={{ height: panelHeight ?? "auto" }}
               className="overflow-hidden"
               initial={false}
-              transition={SPRING}
+              transition={settled ? SPRING : { duration: 0 }}
             >
             <AnimatePresence mode="popLayout" initial={false} custom={dir}>
               {step === 1 && (

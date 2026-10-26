@@ -1,9 +1,16 @@
 import { ApiError, timezoneSchema, utcInstantSchema } from '@openanalytics/contracts'
 import {
   DEFAULT_ANALYTICS_QUERY_CONFIG,
+  FILTER_DIMENSIONS,
+  FILTER_OPERATORS,
+  MAX_FILTER_CLAUSES,
+  MAX_FILTER_VALUES,
+  MAX_FILTER_VALUE_LENGTH,
+  filterValuesFor,
   isUtcDayAligned,
-  isUtcHourAligned,
   isUtcMinuteAligned,
+  isUtcQuarterAligned,
+  type AnalyticsFilter,
   type RollupResolution,
 } from '@openanalytics/domain'
 import { z } from 'zod'
@@ -37,9 +44,11 @@ import type { QueryParameterValue } from './clickhouse.ts'
  * parameter list must match the stored `AggregateFunction` column type
  * (migration 0012).
  *
- * Every analytics operation binds `site_id` and requires site scope, so the
- * registry is also the boundary that makes a cross-site read impossible: there
- * is no operation that omits the site filter.
+ * Every analytics operation binds `site_id` — or, since ADR-0080, the explicit
+ * `site_ids` list a single screen reads its whole account through — and requires
+ * site scope, so the registry is also the boundary that makes a cross-site read
+ * impossible: there is no operation that omits the site filter, and the api
+ * passes only ids the caller is already a member of.
  */
 
 const CONFIG = DEFAULT_ANALYTICS_QUERY_CONFIG
@@ -118,8 +127,20 @@ function defineOperation<TSchema extends z.ZodType>(definition: {
   if (/;|--|\/\*/.test(definition.sql)) {
     throw new Error(`operation "${definition.id}" sql must be a single statement without comments`)
   }
-  if (definition.requiresSiteScope && !placeholders.has('site_id')) {
-    throw new Error(`operation "${definition.id}" is site-scoped but never binds {site_id:...}`)
+  // Site scope is "names its sites", not "names one site" (ADR-0080). The site
+  // card operations bind `{site_ids:Array(UUID)}` because one screen reads the
+  // whole account; either placeholder satisfies the boundary, because the
+  // boundary is that the api decides the id set and the statement cannot widen
+  // it. An operation binding neither could read every site in the cluster, which
+  // is what this assertion has always existed to make impossible.
+  if (
+    definition.requiresSiteScope &&
+    !placeholders.has('site_id') &&
+    !placeholders.has('site_ids')
+  ) {
+    throw new Error(
+      `operation "${definition.id}" is site-scoped but never binds {site_id:...} or {site_ids:...}`,
+    )
   }
   // No analytics operation may read the raw event table (docs snapshot 02 §15,
   // plan Milestone 7 acceptance criterion). Asserted structurally so a future
@@ -178,15 +199,30 @@ function defineOperation<TSchema extends z.ZodType>(definition: {
 // Shared parameter shapes
 // ---------------------------------------------------------------------------
 
-/** UTC-bucket boundary alignment the range must satisfy for its source rollup. */
-type RangeAlignment = 'minute' | 'hour' | 'day'
+/**
+ * UTC-bucket boundary alignment the range must satisfy for its source rollup.
+ *
+ * `quarter` — the fifteen-minute atom (ADR-0079) — replaced `hour` in step 3,
+ * because every read that used to be routed to an hour table is now routed to
+ * its `*_15m` twin and its range is snapped a quarter-hour at a time. It is the
+ * looser of the two: every UTC-hour boundary is also a quarter-hour boundary, so
+ * nothing a caller could send before is refused now.
+ */
+type RangeAlignment = 'minute' | 'quarter' | 'day'
+
+/** What the refusal message calls each boundary. */
+const ALIGNMENT_LABEL: Record<RangeAlignment, string> = {
+  minute: 'minute',
+  quarter: 'quarter-hour',
+  day: 'day',
+}
 
 function isAligned(alignment: RangeAlignment, instant: string): boolean {
   switch (alignment) {
     case 'minute':
       return isUtcMinuteAligned(instant)
-    case 'hour':
-      return isUtcHourAligned(instant)
+    case 'quarter':
+      return isUtcQuarterAligned(instant)
     case 'day':
       return isUtcDayAligned(instant)
   }
@@ -217,12 +253,11 @@ const cutoverDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/)
  * Builds the typed parameter schema for a range operation.
  *
  * The endpoint-alignment refinement is the structural guard behind the rollup
- * choice: an hour operation reads UTC-hour buckets, so a range whose endpoints
- * are not UTC-hour boundaries — a sub-hour timezone's local midnight, say — is
- * rejected here rather than answered with misattributed buckets. A day
- * operation likewise refuses anything but a UTC-midnight boundary, which is why
- * it is only ever routed a UTC request (`chooseResolution` composes non-UTC days
- * from the hour operation instead).
+ * choice: a quarter operation reads UTC quarter-hour buckets, so a range whose
+ * endpoints are not quarter-hour boundaries is rejected here rather than
+ * answered with misattributed buckets. A day operation likewise refuses anything
+ * but a UTC-midnight boundary, which is why it is only ever routed a UTC request
+ * (`chooseResolution` composes non-UTC days from the atom operation instead).
  */
 function rangeParamsSchema(options: RangeParamsOptions) {
   const shape: Record<string, z.ZodTypeAny> = {
@@ -264,7 +299,7 @@ function rangeParamsSchema(options: RangeParamsOptions) {
       if (!isAligned(options.alignment, from) || !isAligned(options.alignment, to)) {
         ctx.addIssue({
           code: 'custom',
-          message: `range endpoints must align to a UTC ${options.alignment} boundary`,
+          message: `range endpoints must align to a UTC ${ALIGNMENT_LABEL[options.alignment]} boundary`,
         })
       }
     })
@@ -381,7 +416,7 @@ function importedFilter(table: string, zone: string): string {
 
 const maxRangeFor: Record<RollupResolution, number> = {
   '1m': MAX_SPAN_MINUTE_MS,
-  '1h': MAX_SPAN_HOUR_MS,
+  '15m': MAX_SPAN_HOUR_MS,
   '1d': MAX_SPAN_DAY_MS,
 }
 
@@ -532,25 +567,25 @@ const timeseriesOperations: readonly QueryOperation[] = [
   }),
   defineTimeseries({
     id: 'analytics.timeseries_hour',
-    summary: 'Events, pageviews and unique visitors per timezone-local hour (metrics_1h).',
-    table: 'metrics_1h',
-    source: '1h',
+    summary: 'Events, pageviews and unique visitors per timezone-local hour (metrics_15m).',
+    table: 'metrics_15m',
+    source: '15m',
     bucketExpr: bucketUtc('toStartOfHour(t.bucket_start, {tz:String})'),
-    alignment: 'hour',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 1_000,
   }),
   defineTimeseries({
     id: 'analytics.timeseries_day',
     summary:
-      'Events, pageviews and unique visitors per timezone-local day, composed from metrics_1h so DST 23/25h days are correct, unioned with the published import before the cutover.',
-    table: 'metrics_1h',
-    source: '1h',
+      'Events, pageviews and unique visitors per timezone-local day, composed from metrics_15m so DST 23/25h days are correct, unioned with the published import before the cutover.',
+    table: 'metrics_15m',
+    source: '15m',
     bucketExpr: bucketUtc('toStartOfDay(t.bucket_start, {tz:String})'),
     // A provider day *is* a local day, so the placement is the whole bucketing:
     // no re-grouping, just the same label the live side computes.
     importedBucketExpr: importedDayInstant('{tz:String}'),
-    alignment: 'hour',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 500,
   }),
@@ -601,9 +636,9 @@ const timeseriesOperations: readonly QueryOperation[] = [
   defineTimeseries({
     id: 'analytics.timeseries_week',
     summary:
-      'Events, pageviews and unique visitors per timezone-local ISO week (Monday start), composed from metrics_1h.',
-    table: 'metrics_1h',
-    source: '1h',
+      'Events, pageviews and unique visitors per timezone-local ISO week (Monday start), composed from metrics_15m.',
+    table: 'metrics_15m',
+    source: '15m',
     // Three steps, each undoing an ambiguity the previous one leaves:
     //   toStartOfWeek(col, 1, tz) → the local Monday, as a `Date` — a calendar
     //     date with no instant attached, so it cannot be a bucket label yet.
@@ -625,7 +660,7 @@ const timeseriesOperations: readonly QueryOperation[] = [
     // week. The zone belongs on the `toDateTime` that turns the resulting Monday
     // back into an instant, which is where it is.
     importedBucketExpr: bucketUtc('toDateTime(toStartOfWeek(i.date, 1), {tz:String})'),
-    alignment: 'hour',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 600,
   }),
@@ -726,10 +761,10 @@ const overviewOperations: readonly QueryOperation[] = [
   defineOverview({
     id: 'analytics.overview_hour',
     summary:
-      'Range totals — events, pageviews, billable events, unique visitors (metrics_1h plus the published import).',
-    table: 'metrics_1h',
-    source: '1h',
-    alignment: 'hour',
+      'Range totals — events, pageviews, billable events, unique visitors (metrics_15m plus the published import).',
+    table: 'metrics_15m',
+    source: '15m',
+    alignment: 'quarter',
   }),
   defineOverview({
     id: 'analytics.overview_day',
@@ -838,7 +873,7 @@ const REPORT_SHAPES: readonly ReportShape[] = [
   {
     slug: 'pages',
     imported: true,
-    hourTable: 'pages_1h',
+    hourTable: 'pages_15m',
     dayTable: 'pages_1d',
     dimensions: ['page_path'],
     measures: ['sum(views) AS views', 'uniqMerge(visitors) AS visitors'],
@@ -848,7 +883,7 @@ const REPORT_SHAPES: readonly ReportShape[] = [
   {
     slug: 'sources',
     imported: true,
-    hourTable: 'sources_1h',
+    hourTable: 'sources_15m',
     dayTable: 'sources_1d',
     dimensions: ['referrer_domain', 'utm_source', 'utm_medium', 'utm_campaign'],
     measures: ['sum(views) AS views', 'uniqMerge(visitors) AS visitors'],
@@ -858,7 +893,7 @@ const REPORT_SHAPES: readonly ReportShape[] = [
   {
     slug: 'geography',
     imported: true,
-    hourTable: 'geography_1h',
+    hourTable: 'geography_15m',
     dayTable: 'geography_1d',
     dimensions: ['country', 'city'],
     measures: ['sum(views) AS views', 'uniqMerge(visitors) AS visitors'],
@@ -868,7 +903,7 @@ const REPORT_SHAPES: readonly ReportShape[] = [
   {
     slug: 'devices',
     imported: true,
-    hourTable: 'devices_1h',
+    hourTable: 'devices_15m',
     dayTable: 'devices_1d',
     dimensions: ['device_type', 'browser', 'os'],
     measures: ['sum(views) AS views', 'uniqMerge(visitors) AS visitors'],
@@ -878,7 +913,7 @@ const REPORT_SHAPES: readonly ReportShape[] = [
   {
     slug: 'custom_events',
     imported: true,
-    hourTable: 'custom_events_1h',
+    hourTable: 'custom_events_15m',
     dayTable: 'custom_events_1d',
     dimensions: ['event_name', 'event_type'],
     measures: [
@@ -892,7 +927,7 @@ const REPORT_SHAPES: readonly ReportShape[] = [
   {
     slug: 'performance',
     imported: false,
-    hourTable: 'performance_1h',
+    hourTable: 'performance_15m',
     dayTable: 'performance_1d',
     dimensions: ['metric', 'device_type'],
     measures: [
@@ -912,8 +947,8 @@ const reportOperations: readonly QueryOperation[] = REPORT_SHAPES.flatMap((shape
   defineReport({
     id: `analytics.${shape.slug}_hour`,
     table: shape.hourTable,
-    source: '1h',
-    alignment: 'hour',
+    source: '15m',
+    alignment: 'quarter',
     dimensions: shape.dimensions,
     measures: shape.measures,
     orderBy: shape.orderBy,
@@ -1009,9 +1044,9 @@ function defineCustomEventSamples(definition: {
 const customEventSampleOperations: readonly QueryOperation[] = [
   defineCustomEventSamples({
     id: 'analytics.custom_event_samples_hour',
-    table: 'custom_event_samples_1h',
-    source: '1h',
-    alignment: 'hour',
+    table: 'custom_event_samples_15m',
+    source: '15m',
+    alignment: 'quarter',
     summary: 'Last-seen instant, page and properties per custom event. Hour rollup.',
   }),
   defineCustomEventSamples({
@@ -1082,10 +1117,11 @@ function defineImportedReport(definition: {
     requiresSiteScope: true,
     params: rangeParamsSchema({
       // The api routes these beside an hour- or a day-rollup report, and a
-      // day-aligned range is hour-aligned too, so the looser boundary accepts
-      // both without ever accepting a sub-hour one.
+      // day-aligned range is quarter-aligned too, so the looser boundary
+      // accepts both — and it has to be the looser one, because the live report
+      // beside it is routed a quarter-hour-snapped range (ADR-0079, step 3).
       maxRangeMs: MAX_SPAN_DAY_MS,
-      alignment: 'hour',
+      alignment: 'quarter',
       // The same placement the live half of this report used. Two halves of one
       // merged list that disagreed about which days a range contains would be a
       // table whose rows come from different windows.
@@ -1344,14 +1380,14 @@ function defineSessionProvisional(definition: {
 }
 
 const sessionOperations: readonly QueryOperation[] = [
-  // Hour grain: whole-hour/UTC local hours from the 1h layers.
+  // Hour grain: local hours composed from the 15m layers, in any zone.
   defineSessionFinalized({
     id: 'analytics.sessions_finalized_hour',
-    summary: 'Finalized session totals per timezone-local hour (session_rollups_1h).',
-    table: 'session_rollups_1h',
+    summary: 'Finalized session totals per timezone-local hour (session_rollups_15m).',
+    table: 'session_rollups_15m',
     bucketExpr: bucketUtc('toStartOfHour(cur.bucket_start, {tz:String})'),
-    source: '1h',
-    alignment: 'hour',
+    source: '15m',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 2_000,
   }),
@@ -1359,8 +1395,8 @@ const sessionOperations: readonly QueryOperation[] = [
     id: 'analytics.sessions_provisional_hour',
     summary: 'Provisional session totals per timezone-local hour (session_facts_versions).',
     bucketExpr: bucketUtc('toStartOfHour(cur.session_start, {tz:String})'),
-    source: '1h',
-    alignment: 'hour',
+    source: '15m',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 2_000,
   }),
@@ -1388,11 +1424,11 @@ const sessionOperations: readonly QueryOperation[] = [
   // are correct, the same rule the additive day chart uses.
   defineSessionFinalized({
     id: 'analytics.sessions_finalized_day_local',
-    summary: 'Finalized session totals per timezone-local day, composed from session_rollups_1h.',
-    table: 'session_rollups_1h',
+    summary: 'Finalized session totals per timezone-local day, composed from session_rollups_15m.',
+    table: 'session_rollups_15m',
     bucketExpr: bucketUtc('toStartOfDay(cur.bucket_start, {tz:String})'),
-    source: '1h',
-    alignment: 'hour',
+    source: '15m',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 500,
   }),
@@ -1401,10 +1437,172 @@ const sessionOperations: readonly QueryOperation[] = [
     summary:
       'Provisional session totals per timezone-local day, composed from session_facts_versions.',
     bucketExpr: bucketUtc('toStartOfDay(cur.session_start, {tz:String})'),
-    source: '1h',
-    alignment: 'hour',
+    source: '15m',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 500,
+  }),
+]
+
+// ---------------------------------------------------------------------------
+// Entry, exit and bounce per page (ADR-0075, D-E1).
+//
+// Migration `0007_pages_hour_day.sql` states in its own header why the pages
+// rollup excludes these: they are NOT ADDITIVE over an incremental view — a late
+// second pageview has to undo a bounce the view already recorded — and it points
+// at the finalizer as the thing that would make them possible. The finalizer
+// shipped in M8. This is the read that was waiting for it.
+//
+// They come from the session facts and they cannot come from anywhere else.
+// `session_rollups_15m`/`_1d` are keyed `(site_id, bucket_start)` with NO path
+// dimension (migration 0014), and `pages_15m`/`_1d` are event-grain with no
+// session in them. So this operation sits on the same provisional-over-facts
+// layer the session totals sit on, and reads the fact table by the contract
+// migration 0013 mandates:
+//
+//   **argMax over `version` per `(site_id, session_id)` FIRST, then filter
+//   `retracted = 0`.** Filtering `retracted = 0` before the version selection
+//   discards the tombstone and resurrects the stale version underneath it, which
+//   is the exact bug the tombstone exists to prevent.
+//
+// One session contributes two rows — its entry path and its exit path — through
+// a fixed two-element `arrayJoin`. A single-page session contributes both at the
+// same path, which is correct: it entered there and it left there, and
+// `uniqExact` still counts it as one session.
+//
+// **Bounce is derived, never stored twice** (0013's comment on `engaged`), and it
+// is counted on the ENTRY row alone: a bounce is a property of where the visit
+// began. Its denominator is therefore `entrances`, which is returned beside it so
+// a ratio computed anywhere names the number it was divided by.
+//
+// A session with no pageview at all — a visit that fired only a custom event —
+// carries the empty entry/exit path, and the empty path is dropped rather than
+// returned as a row. It is not a page, and the pages report this decorates has no
+// row for it either.
+// ---------------------------------------------------------------------------
+
+function definePageSessions(definition: {
+  id: string
+  source: RollupResolution
+  alignment: RangeAlignment
+  summary: string
+  /**
+   * Whether this variant restricts itself to the sessions a filter set selects
+   * (ADR-0075, D-F1).
+   *
+   * The filter lands INSIDE the fact subquery rather than beside the join,
+   * because here the fact rows are the population being counted — there is no
+   * events_raw side at all — so a filtered entry/exit read needs no raw access
+   * and no session-hint join. It is the one filtered read that is genuinely
+   * cheaper than its unfiltered self.
+   */
+  filtered?: boolean
+}): QueryOperation {
+  const filtered = definition.filtered === true
+  const sql = [
+    'SELECT',
+    '  tupleElement(live.slot, 1) AS page_path,',
+    '  countIf(tupleElement(live.slot, 2) = 1) AS entrances,',
+    '  countIf(tupleElement(live.slot, 3) = 1) AS exits,',
+    '  countIf(tupleElement(live.slot, 2) = 1 AND live.engaged = 0) AS bounces,',
+    // Distinct sessions that entered OR exited at this path, which is what the
+    // two arrayJoin rows of a single-page session must not double.
+    '  uniqExact(live.session_id) AS sessions',
+    'FROM (',
+    '  SELECT',
+    '    cur.session_id AS session_id,',
+    '    cur.engaged AS engaged,',
+    '    arrayJoin([',
+    '      (cur.entry_page_path, toUInt8(1), toUInt8(0)),',
+    '      (cur.exit_page_path, toUInt8(0), toUInt8(1))',
+    '    ]) AS slot',
+    '  FROM (',
+    '    SELECT',
+    '      sfv.session_id AS session_id,',
+    '      argMax(sfv.entry_page_path, sfv.version) AS entry_page_path,',
+    '      argMax(sfv.exit_page_path, sfv.version) AS exit_page_path,',
+    '      argMax(sfv.engaged, sfv.version) AS engaged,',
+    ...(filtered
+      ? FILTER_DIMENSIONS.map(
+          (dimension) => `      argMax(sfv.${dimension}, sfv.version) AS ${dimension},`,
+        )
+      : []),
+    '      argMax(sfv.retracted, sfv.version) AS retracted',
+    '    FROM session_facts_versions AS sfv',
+    '    WHERE sfv.site_id = {site_id:UUID}',
+    "      AND sfv.session_start >= toDateTime64({from:String}, 3, 'UTC')",
+    "      AND sfv.session_start <  toDateTime64({to:String}, 3, 'UTC')",
+    '    GROUP BY sfv.site_id, sfv.session_id',
+    '  ) AS cur',
+    '  WHERE cur.retracted = 0',
+    ...(filtered ? [filterConjuncts('cur').replace(/^ {4}/gm, '  ')] : []),
+    ') AS live',
+    "WHERE tupleElement(live.slot, 1) != ''",
+    'GROUP BY page_path',
+    // Ranked by the two measures together, because the api may cut the merged
+    // list by either one and a list ordered by only one of them would arrive
+    // already missing the top of the other.
+    'ORDER BY entrances + exits DESC',
+    'LIMIT {limit:UInt32}',
+  ].join('\n')
+
+  return defineOperation({
+    id: definition.id,
+    summary: definition.summary,
+    requiresSiteScope: true,
+    // The facts layer is revisable until the finalizer's watermark passes it, so
+    // the short TTL — the same choice, for the same reason, as the provisional
+    // session operations above.
+    cacheProfile: 'default',
+    params: filtered
+      ? filteredParamsSchema({
+          maxRangeMs: Math.min(maxRangeFor[definition.source], FILTERED_MAX_SPAN_MS),
+          alignment: definition.alignment,
+          withTimezone: false,
+          withLimit: true,
+        })
+      : rangeParamsSchema({
+          // Deliberately the pages REPORT's cap rather than a tighter one of its
+          // own: this decorates that report, and a decoration that refuses a
+          // range the report answers would render as missing data on a working
+          // screen.
+          maxRangeMs: maxRangeFor[definition.source],
+          alignment: definition.alignment,
+          // No cutover and no zone. An imported provider day has no session in
+          // it — no entry, no exit, no bounce — so there is nothing on the
+          // imported side of the partition for this to either include or
+          // exclude. Binding the cutover would be a bound value the SQL never
+          // uses, which the definition checker rejects.
+          withTimezone: false,
+          withLimit: true,
+          withImport: false,
+        }),
+    sql,
+    maxRows: TOP_N_MAX,
+    bind: (params: Record<string, unknown>) => ({
+      site_id: params['site_id'] as string,
+      from: toClickHouseInstant(params['from'] as string),
+      to: toClickHouseInstant(params['to'] as string),
+      limit: params['limit'] as number,
+      ...(filtered ? bindFilters(params['filters'] as readonly AnalyticsFilter[]) : {}),
+    }),
+  })
+}
+
+const pageSessionOperations: readonly QueryOperation[] = [
+  definePageSessions({
+    id: 'analytics.page_sessions_hour',
+    source: '15m',
+    alignment: 'quarter',
+    summary:
+      'Entrances, exits, bounces and sessions per page path from the session facts. Quarter-hour-aligned.',
+  }),
+  definePageSessions({
+    id: 'analytics.page_sessions_day',
+    source: '1d',
+    alignment: 'day',
+    summary:
+      'Entrances, exits, bounces and sessions per page path from the session facts. UTC-day-aligned.',
   }),
 ]
 
@@ -1980,7 +2178,7 @@ const recentVisitorOperations: readonly QueryOperation[] = [
 //
 // Four families, and the split between them is the D-212 layering made visible:
 //
-//   * the two BUCKET families (timeseries, summary) read `revenue_1h`/`_1d` — a
+//   * the two BUCKET families (timeseries, summary) read `revenue_15m`/`_1d` — a
 //     versioned swap target, so every read is `argMax(col, generation)` per
 //     (site, bucket) and then a sum across the range, never `FINAL`;
 //   * the two OBJECT families (transactions, journey) read the FACTS
@@ -2152,7 +2350,7 @@ const revenueUnconvertedOperation = defineOperation({
     // other fact-touching read here is allowed, so the summary refuses the same
     // ranges its own timeseries does.
     maxRangeMs: MAX_SPAN_HOUR_MS,
-    alignment: 'hour',
+    alignment: 'quarter',
     withTimezone: false,
     withLimit: false,
   }),
@@ -2487,11 +2685,11 @@ const revenueOrderObjectsOperation = defineOperation({
 const revenueOperations: readonly QueryOperation[] = [
   defineRevenueTimeseries({
     id: 'analytics.revenue_timeseries_hour',
-    summary: 'Revenue totals per timezone-local hour (revenue_1h).',
-    table: 'revenue_1h',
+    summary: 'Revenue totals per timezone-local hour (revenue_15m).',
+    table: 'revenue_15m',
     bucketExpr: bucketUtc('toStartOfHour(cur.bucket_start, {tz:String})'),
-    source: '1h',
-    alignment: 'hour',
+    source: '15m',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 2_000,
   }),
@@ -2505,26 +2703,26 @@ const revenueOperations: readonly QueryOperation[] = [
     withTimezone: false,
     maxRows: 4_000,
   }),
-  // A non-UTC local day is composed from the hour rollup, exactly as the session
+  // A non-UTC local day is composed from the atom rollup, exactly as the session
   // and additive families do, so a DST 23/25-hour day is correct rather than
   // shifted. Without it a non-UTC day chart would either be refused or answered
   // with UTC-day buckets wearing local labels.
   defineRevenueTimeseries({
     id: 'analytics.revenue_timeseries_day_local',
-    summary: 'Revenue totals per timezone-local day, composed from revenue_1h.',
-    table: 'revenue_1h',
+    summary: 'Revenue totals per timezone-local day, composed from revenue_15m.',
+    table: 'revenue_15m',
     bucketExpr: bucketUtc('toStartOfDay(cur.bucket_start, {tz:String})'),
-    source: '1h',
-    alignment: 'hour',
+    source: '15m',
+    alignment: 'quarter',
     withTimezone: true,
     maxRows: 500,
   }),
   defineRevenueSummary({
     id: 'analytics.revenue_summary_hour',
-    summary: 'Revenue totals over a range, read from revenue_1h.',
-    table: 'revenue_1h',
-    source: '1h',
-    alignment: 'hour',
+    summary: 'Revenue totals over a range, read from revenue_15m.',
+    table: 'revenue_15m',
+    source: '15m',
+    alignment: 'quarter',
   }),
   defineRevenueSummary({
     id: 'analytics.revenue_summary_day',
@@ -2537,6 +2735,232 @@ const revenueOperations: readonly QueryOperation[] = [
   revenueTransactionsOperation,
   revenueTransactionJourneyOperation,
   revenueOrderObjectsOperation,
+]
+
+// ---------------------------------------------------------------------------
+// Site cards — the whole account's list figures in one read (ADR-0080).
+//
+// The first operations in this registry that bind `{site_ids:Array(UUID)}`
+// instead of `{site_id:UUID}`, and the invariant they widen is worth stating
+// precisely, because "every operation binds site_id" was the sentence that made
+// a cross-site read impossible:
+//
+//   every analytics operation binds `{site_id:UUID}` **or**
+//   `{site_ids:Array(UUID)}`; the api passes only ids the caller is a member of,
+//   so the gateway still never reads a site nobody bound.
+//
+// The boundary is unchanged — it is still the api that decides which sites a
+// request may see, and still impossible here to read a site that was not named.
+// What changes is arity, and the reason it changes is that `GET /v1/sites` is
+// one screen: the alternative was N × `analytics.overview_day` plus N ×
+// `analytics.timeseries_week_utc` per dashboard load, which is the frontend's
+// N+1 moved one hop down rather than removed.
+//
+// Both read the UTC-day rollups only. That is a deliberate departure from
+// ADR-0079 D5 ("every window is cut on the site's own zone"), written down in
+// ADR-0080 D3: `toStartOfWeek` takes one constant timezone per statement, so a
+// single query cannot cut each site's weeks on that site's own clock, and the
+// 15m path that could is capped at MAX_SPAN_HOUR_DAYS (400 days) — far short of
+// "all time". The card is an unlabelled, axis-less line, so the week boundary's
+// zone is not a thing its reader can see; the all-time totals have no zone to be
+// wrong about at all.
+// ---------------------------------------------------------------------------
+
+/**
+ * Ceiling on how many sites one call may name.
+ *
+ * Not a tuning knob for the api's own cap (`SITES_CARD_MAX_SITES`) but the
+ * structural one under it: `maxRows` is derived from it, so a request naming
+ * more sites than this would come back capped by row truncation — a silently
+ * short answer — rather than refused. Prod's largest account has 4 sites
+ * (measured 2026-09-12), so this is headroom, not a limit anyone meets.
+ */
+const SITES_CARD_MAX_SITE_IDS = 100
+
+/** Sparkline width, in whole ISO weeks — the span bound on the week branch. */
+const SITES_CARD_MAX_WEEKS = 40
+
+/** Rows one site can contribute: one per week in the window, plus its total. */
+const SITES_CARD_ROWS_PER_SITE = SITES_CARD_MAX_WEEKS + 1
+
+/**
+ * `['<uuid>','<uuid>']` — the text form ClickHouse parses an `Array(UUID)`
+ * parameter from.
+ *
+ * Still a bound parameter, not interpolation: this string is the *value* of
+ * `param_site_ids`, never part of the statement, and ClickHouse parses it
+ * server-side against the declared `Array(UUID)` type. The quoting is safe
+ * because every element has already been through `z.uuid()`, which admits hex
+ * digits and hyphens and nothing else — there is no element that could carry a
+ * quote to close.
+ */
+function toClickHouseUuidArray(ids: readonly string[]): string {
+  return `[${ids.map((id) => `'${id}'`).join(',')}]`
+}
+
+/** UTC Monday midnight — the ISO week boundary `toStartOfWeek(x, 1)` produces. */
+function isUtcMondayAligned(instant: string): boolean {
+  return isUtcDayAligned(instant) && new Date(instant).getUTCDay() === 1
+}
+
+const siteCardsParamsSchema = z
+  .strictObject({
+    site_ids: z
+      .array(z.uuid())
+      .min(1)
+      .max(SITES_CARD_MAX_SITE_IDS)
+      // De-duplicated rather than de-duplicating: a repeated id is a caller bug
+      // (a membership list built twice), and answering it would return one
+      // site's rows twice under a key the api then has to reconcile.
+      .refine((ids) => new Set(ids).size === ids.length, {
+        message: 'site_ids must not repeat an id',
+      }),
+    from: utcInstantSchema,
+    to: utcInstantSchema,
+  })
+  .superRefine((value, ctx) => {
+    const fromMs = Date.parse(value.from)
+    const toMs = Date.parse(value.to)
+    if (fromMs >= toMs) {
+      ctx.addIssue({ code: 'custom', message: 'range must be half-open with from < to' })
+      return
+    }
+    // Monday-aligned, not merely day-aligned. The week branch groups with
+    // `toStartOfWeek(…, 1)`, so an endpoint mid-week would produce a first or
+    // last bucket holding a fraction of a week beside six whole ones — a
+    // sparkline point that is short for a reason no reader can see. Refusing
+    // the range is the only way to keep every plotted point the same width.
+    if (!isUtcMondayAligned(value.from) || !isUtcMondayAligned(value.to)) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'range endpoints must be UTC Monday midnights (ISO week boundaries)',
+      })
+    }
+    if (toMs - fromMs > SITES_CARD_MAX_WEEKS * 7 * MS_PER_DAY) {
+      ctx.addIssue({
+        code: 'custom',
+        message: `range span exceeds this operation's ${SITES_CARD_MAX_WEEKS}-week maximum`,
+      })
+    }
+  })
+
+/**
+ * Per-site all-time totals and the trailing weekly series, in one statement.
+ *
+ * Two branches of a `UNION ALL` with *different* filters, which is the whole
+ * point of unioning them rather than deriving one from the other:
+ *
+ *   * the total branch has **no lower bound** — "all time" read literally, the
+ *     same span `analytics.overview_day` covers when the dashboard anchors its
+ *     widest interval at `created_at`;
+ *   * the week branch is bounded to `[from, to)`, the trailing 40 ISO weeks.
+ *
+ * And a total is emphatically **not** the sum of the weeks. `visitors` is a
+ * `uniqMerge` of the stored states (ADR-0036: filtered to the page-view
+ * population, so `visitors <= pageviews` holds on every row), and a person who
+ * visited in two different weeks is one visitor in the total and one in each of
+ * those two weeks. Summing the weekly numbers would over-count them; the
+ * migration suite pins exactly that case against a live ClickHouse.
+ *
+ * `is_total` rather than a nullable `week`: the branches of a `UNION ALL` have
+ * to agree on column types, and a discriminator the api reads is clearer at both
+ * ends than widening the week column to `Nullable` so one branch can put a
+ * `NULL` in it.
+ */
+const sitesAllTimeOperation = defineOperation({
+  id: 'analytics.sites_all_time',
+  summary:
+    'All-time pageviews and unique visitors per site, plus the trailing ISO-week series (metrics_1d, UTC).',
+  requiresSiteScope: true,
+  params: siteCardsParamsSchema,
+  sql: [
+    'SELECT',
+    '  t.site_id AS site_id,',
+    '  toUInt8(0) AS is_total,',
+    "  toDateTime64(toStartOfWeek(t.bucket_start, 1), 3, 'UTC') AS week,",
+    "  sumIf(t.events, t.event_type = 'page_view') AS pageviews,",
+    "  uniqMergeIf(t.visitors, t.event_type = 'page_view') AS visitors",
+    'FROM metrics_1d AS t',
+    'WHERE t.site_id IN {site_ids:Array(UUID)}',
+    "  AND t.bucket_start >= toDateTime64({from:String}, 3, 'UTC')",
+    "  AND t.bucket_start < toDateTime64({to:String}, 3, 'UTC')",
+    'GROUP BY t.site_id, week',
+    'UNION ALL',
+    'SELECT',
+    '  t.site_id AS site_id,',
+    '  toUInt8(1) AS is_total,',
+    // A constant the api never reads, present only so both branches project the
+    // same column type. The discriminator is what says this row has no week.
+    "  toDateTime64(0, 3, 'UTC') AS week,",
+    "  sumIf(t.events, t.event_type = 'page_view') AS pageviews,",
+    "  uniqMergeIf(t.visitors, t.event_type = 'page_view') AS visitors",
+    'FROM metrics_1d AS t',
+    'WHERE t.site_id IN {site_ids:Array(UUID)}',
+    "  AND t.bucket_start < toDateTime64({to:String}, 3, 'UTC')",
+    'GROUP BY t.site_id',
+  ].join('\n'),
+  maxRows: SITES_CARD_MAX_SITE_IDS * SITES_CARD_ROWS_PER_SITE,
+  // The api caches this one, keyed by the caller's membership set and held for
+  // minutes rather than the gateway cache's seconds (ADR-0080 D5). Caching it
+  // here as well would put two TTLs on one answer, the shorter of which decides
+  // nothing.
+  cacheable: false,
+  bind: (params) => ({
+    site_ids: toClickHouseUuidArray(params.site_ids),
+    from: toClickHouseInstant(params.from),
+    to: toClickHouseInstant(params.to),
+  }),
+})
+
+/**
+ * All-time net revenue per site, in each site's own reporting currency.
+ *
+ * `revenue_1d` is a `ReplacingMergeTree(generation)`, so every read takes the
+ * current generation of each bucket with `argMax(…, generation)` before summing
+ * — never `FINAL`, and never a bare `sum` over the table, which would add every
+ * superseded generation of every recomputed bucket (the D-212 read rule).
+ *
+ * There is no `currency` column and there must not be one: the worker converts
+ * into the site's reporting currency when it writes the rollup (ADR-0033 D2c),
+ * so the label belongs to `sites.reporting_currency` and the api attaches it.
+ * The api also calls this only for sites that actually have a revenue credential
+ * row — a site with no provider connected is not a zero, it is a different
+ * answer, and ADR-0080 D4 keeps the two apart above this query.
+ */
+const sitesAllTimeRevenueOperation = defineOperation({
+  id: 'analytics.sites_all_time_revenue',
+  summary: 'All-time net revenue per site, in the site reporting currency (revenue_1d).',
+  requiresSiteScope: true,
+  params: siteCardsParamsSchema,
+  sql: [
+    'SELECT',
+    '  cur.site_id AS site_id,',
+    '  sum(cur.net_minor) AS net_minor',
+    'FROM (',
+    '  SELECT',
+    '    rr.site_id AS site_id,',
+    '    argMax(rr.net_minor, rr.generation) AS net_minor',
+    '  FROM revenue_1d AS rr',
+    '  WHERE rr.site_id IN {site_ids:Array(UUID)}',
+    "    AND rr.bucket_start < toDateTime64({to:String}, 3, 'UTC')",
+    '  GROUP BY rr.site_id, rr.bucket_start',
+    ') AS cur',
+    'GROUP BY cur.site_id',
+  ].join('\n'),
+  maxRows: SITES_CARD_MAX_SITE_IDS,
+  cacheable: false,
+  // `from` is validated and deliberately not bound: this half is all-time only,
+  // and `defineOperation` rejects a bound value the statement ignores. Sharing
+  // the schema is what keeps one window definition for both halves of the card.
+  bind: (params) => ({
+    site_ids: toClickHouseUuidArray(params.site_ids),
+    to: toClickHouseInstant(params.to),
+  }),
+})
+
+const siteCardOperations: readonly QueryOperation[] = [
+  sitesAllTimeOperation,
+  sitesAllTimeRevenueOperation,
 ]
 
 // ---------------------------------------------------------------------------
@@ -2583,6 +3007,573 @@ export const clickhouseRoundtripOperation = defineOperation({
   bind: () => ({}),
 })
 
+// ---------------------------------------------------------------------------
+// Filtered reads (ADR-0075, D-F1 … D-F5).
+//
+// The third family that reads `events_raw`, and it earns the exception the way
+// the funnel and the recent-visitor family earn theirs, which is the only way it
+// may be earned here: a hard site filter, a span capped far below the rollup
+// reports', a row cap, and an aggregate that returns a bounded breakdown rather
+// than rows of events.
+//
+// ## Why a filtered read cannot use a rollup at all
+//
+// Every rollup has already aggregated away the thing a filter selects on.
+// `pages_15m` is `(site, bucket, page_path)`; there is no session in it and no
+// referrer either. `sources_15m` carries a referrer but has no page. A filtered
+// pages report is "the pages viewed by sessions that came from X", and no
+// pre-aggregated table has both halves. So a filter is answered from the facts —
+// and D-F4 is what keeps that cost off everybody else: these operations are
+// ADDITIONAL, the unfiltered ones are untouched, and a dashboard with no chips
+// issues byte-identically the same queries it issued before this family existed.
+//
+// ## The predicate, and why it is still a constant statement (D-F3)
+//
+// No SQL reaches the gateway from the api and no dimension name is ever spliced.
+// The statement carries a fixed block — one conjunct per dimension in
+// `FILTER_DIMENSIONS`, generated at module load — of the shape
+//
+//     AND ({f_country_on:UInt8} = 0 OR has(<values>, cur.country))
+//
+// so an inactive dimension is switched off by a BOUND VALUE rather than by a
+// different statement. Every placeholder is bound on every call, which is what
+// `defineOperation`'s two-directional check demands, and adding a fifth
+// dimension is a data change to `FILTER_DIMENSIONS` plus a column on the fact
+// table — never an edit to a statement.
+//
+// The values arrive as one JSON string per dimension and are read back with
+// `JSONExtract(…, 'Array(String)')`. A JSON string rather than a ClickHouse
+// `Array(String)` parameter because the HTTP reader stringifies every bound
+// value, and hand-rolling ClickHouse's array literal escaping for a city called
+// `N'Djamena` is a bug waiting to be written. `JSON.stringify` already has that
+// rule and both ends already agree on it.
+//
+// ## The join, and the trap it steps around
+//
+// `session_facts_versions.session_id` is the sessionizer's own hash of
+// (site, earliest event id) — migration 0013 — and it is NOT what `events_raw`
+// carries. The raw table's `session_id` is the site-scoped HMAC of the client
+// hint, which the fact table stores as `session_hint`. Joining on the
+// same-named column returns nothing at all, silently, which is the worst
+// possible failure for a filter: an empty report reads as "no traffic from that
+// source" rather than as a bug.
+//
+// So the join is `(er.site_id, er.session_id) IN (SELECT site_id, session_hint …)`.
+//
+// **`anonymous_id` is deliberately NOT part of the key**, and this is a
+// departure worth stating. The fact's `anonymous_id` is the ENTRY event's, and
+// the D-102 identity bridge exists precisely because one visit can span two
+// anonymous ids — a UTC-midnight rotation, a VPN hop, a mobile carrier's CGNAT.
+// Every event after the rotation carries the second id, so a key that included
+// the anonymous id would drop the tail of every bridged session from every
+// filtered report, on mobile traffic above all. The hint alone is safe as an
+// identity: it is minted randomly per browser tab and hashed per site, so two
+// visitors cannot carry the same one — the sessionizer's own header says so, and
+// it is the reason the bridge requires a shared hint in the first place.
+//
+// The residual imprecision is the other direction and is stated rather than
+// hidden: one hint can outlive one session (a tab left open across a 30-minute
+// gap produces two canonical sessions under one hint), so when only one of them
+// matches the filter the other's events are counted too. It is bounded by the
+// range filter and by the 24-hour session cap, and it is smaller than the error
+// that including `anonymous_id` would have caused.
+//
+// ## The session window
+//
+// A session that began before `from` can own events inside the range, so the
+// subquery scans `[from - session cap, to)` rather than `[from, to)`. The cap is
+// ADR-0018's 24 hours, which makes the widening exact rather than generous: a
+// session containing an event at `t` cannot have started before `t - 24h`.
+//
+// ## Events with no session hint
+//
+// The collector writes `session_id: null` when the client sent none — a
+// server-side SDK call, a widget write, any non-tracker producer. Such an event
+// belongs to no canonical session, so no session attribute can select it, and it
+// is outside every filtered read BY CONSTRUCTION rather than by omission. That
+// is the honest reading of D-F1: a filter selects sessions, and an event with no
+// session is in none of them. It is stated in the ADR and in the frontend note
+// so a filtered total that sits below the unfiltered one is read as the rule it
+// is.
+//
+// ## What is imported is not here
+//
+// A staged provider day carries no session, so there is nothing on the imported
+// side of the cutover for a session-scoped filter to include or exclude. A
+// filtered read is live-only by construction, binds no cutover and no run id,
+// and the api marks the response's `data_sources` accordingly.
+// ---------------------------------------------------------------------------
+
+/**
+ * Longest span a filtered read may scan.
+ *
+ * The funnel's cap, deliberately reused rather than invented: it is the bound
+ * this cluster has actually been operated at for a raw, site-scoped, aggregate
+ * read, and it is far below the rollup reports' 400-day and 3660-day ceilings,
+ * which is what D-F5 asks for. A longer filtered range is refused by name in the
+ * api before a query is issued.
+ */
+const FILTERED_MAX_SPAN_MS = 92 * MS_PER_DAY
+
+/** ADR-0018's session cap: how far before `from` a session could have begun. */
+const SESSION_CAP_MS = 24 * MS_PER_HOUR
+
+/** Bounded like the funnel: one row per key, and a hard ceiling on the keys. */
+const FILTERED_TOP_N_MAX = 500
+
+/**
+ * The fixed predicate block: one conjunct per dimension, generated at module
+ * load from the domain's own list so the statement stays a constant.
+ */
+function filterConjuncts(alias: string): string {
+  return FILTER_DIMENSIONS.map(
+    (dimension) =>
+      `    AND ({f_${dimension}_on:UInt8} = 0 OR ` +
+      `has(JSONExtract({f_${dimension}:String}, 'Array(String)'), toString(${alias}.${dimension})))`,
+  ).join('\n')
+}
+
+/**
+ * The session-selection subquery, indented to sit inside an `IN (...)`.
+ *
+ * `argMax` over `version` per `(site_id, session_id)` FIRST and `retracted = 0`
+ * only afterwards, which is migration 0013's read contract and not a style
+ * choice: filtering `retracted = 0` before the version selection discards the
+ * tombstone and resurrects the stale version underneath it, so a retracted
+ * session would be counted — the exact bug the tombstone exists to prevent.
+ */
+const FILTER_SESSION_SUBQUERY = [
+  '  SELECT',
+  '    cur.site_id AS site_id,',
+  // **Every** hint the session carried, not just its entry's (migration 0023).
+  // The sessionizer partitions by resolved identity rather than by hint, so two
+  // tabs of one anonymous visitor are one session with two hints — and on a
+  // production fortnight the entry hint alone found 82% of the page views while
+  // 99% of them had a session under the same anonymous id. `arrayJoin` over the
+  // stored list closes that gap without the range join the alternative needs.
+  //
+  // A session that carried no hint expands to no rows here, which is the honest
+  // answer rather than an omission: it cannot be joined to its events at all,
+  // and a row with an empty hint would match every hintless event on the site.
+  "    arrayJoin(arrayFilter(hint -> hint != '', cur.session_hints)) AS session_hint",
+  '  FROM (',
+  '    SELECT',
+  '      sfv.site_id AS site_id,',
+  '      argMax(sfv.session_hints, sfv.version) AS session_hints,',
+  '      argMax(sfv.referrer_domain, sfv.version) AS referrer_domain,',
+  '      argMax(sfv.country, sfv.version) AS country,',
+  '      argMax(sfv.city, sfv.version) AS city,',
+  '      argMax(sfv.device_type, sfv.version) AS device_type,',
+  '      argMax(sfv.retracted, sfv.version) AS retracted',
+  '    FROM session_facts_versions AS sfv',
+  '    WHERE sfv.site_id = {site_id:UUID}',
+  "      AND sfv.session_start >= toDateTime64({session_from:String}, 3, 'UTC')",
+  "      AND sfv.session_start <  toDateTime64({to:String}, 3, 'UTC')",
+  '    GROUP BY sfv.site_id, sfv.session_id',
+  '  ) AS cur',
+  '  WHERE cur.retracted = 0',
+  filterConjuncts('cur'),
+].join('\n')
+
+/** The events-side WHERE every filtered read shares. */
+function filteredEventFilter(pageviewsOnly: boolean): string {
+  return [
+    'FROM events_raw AS er',
+    'WHERE er.site_id = {site_id:UUID}',
+    "  AND er.occurred_at >= toDateTime64({from:String}, 3, 'UTC')",
+    "  AND er.occurred_at <  toDateTime64({to:String}, 3, 'UTC')",
+    // Every breakdown here mirrors its rollup's own population exactly
+    // (migrations 0007-0010 all read `WHERE type = 'page_view'`), so a filtered
+    // row and an unfiltered row of the same report are the same measure.
+    ...(pageviewsOnly ? ["  AND er.type = 'page_view'"] : []),
+    "  AND er.session_id != ''",
+    '  AND (er.site_id, er.session_id) IN (',
+    FILTER_SESSION_SUBQUERY,
+    '  )',
+  ].join('\n')
+}
+
+/**
+ * The unique-visitor expression, spelled exactly as every rollup spells it.
+ *
+ * `uniqState(if(user_id != '', user_id, anonymous_id))` is what migrations
+ * 0006-0010 store, so this is the same population counted the same way — the
+ * point being that switching a filter on must not also switch the definition of
+ * a visitor.
+ */
+const FILTERED_VISITOR_EXPR = "if(er.user_id != '', er.user_id, er.anonymous_id)"
+
+/** The parameters every filtered operation takes, beyond its own extras. */
+function filteredParamsSchema(options: {
+  maxRangeMs: number
+  alignment: RangeAlignment
+  withTimezone: boolean
+  withLimit: boolean
+}) {
+  const shape: Record<string, z.ZodTypeAny> = {
+    site_id: z.uuid(),
+    from: utcInstantSchema,
+    to: utcInstantSchema,
+    filters: z
+      .array(
+        z.strictObject({
+          dimension: z.enum(FILTER_DIMENSIONS),
+          operator: z.enum(FILTER_OPERATORS),
+          values: z.array(z.string().max(MAX_FILTER_VALUE_LENGTH)).min(1).max(MAX_FILTER_VALUES),
+        }),
+      )
+      .min(1)
+      .max(MAX_FILTER_CLAUSES),
+  }
+  if (options.withTimezone) shape['timezone'] = timezoneSchema
+  if (options.withLimit) {
+    shape['limit'] = z.number().int().min(1).max(FILTERED_TOP_N_MAX).default(TOP_N_DEFAULT)
+  }
+
+  return z
+    .strictObject(shape)
+    .superRefine((value: Record<string, unknown>, ctx: z.RefinementCtx) => {
+      const from = value['from'] as string
+      const to = value['to'] as string
+      const fromMs = Date.parse(from)
+      const toMs = Date.parse(to)
+
+      if (fromMs >= toMs) {
+        ctx.addIssue({ code: 'custom', message: 'range must be half-open with from < to' })
+        return
+      }
+      if (toMs - fromMs > options.maxRangeMs) {
+        ctx.addIssue({
+          code: 'custom',
+          message: `filtered range span exceeds this operation's ${options.maxRangeMs}ms maximum`,
+        })
+      }
+      if (!isAligned(options.alignment, from) || !isAligned(options.alignment, to)) {
+        ctx.addIssue({
+          code: 'custom',
+          message: `range endpoints must align to a UTC ${ALIGNMENT_LABEL[options.alignment]} boundary`,
+        })
+      }
+      // D-F4, asserted structurally: an EMPTY filter set may not reach this
+      // family at all. The unfiltered read is a different, cheaper operation on
+      // a rollup, and a caller that sent no chips must never be routed here —
+      // so the operation refuses rather than trusting the router.
+      const filters = value['filters'] as { values: readonly string[] }[]
+      if (!filters.some((filter) => filter.values.length > 0)) {
+        ctx.addIssue({
+          code: 'custom',
+          message: 'a filtered operation requires at least one filter value; use the rollup read',
+        })
+      }
+    })
+}
+
+/** Binds the fixed per-dimension flag/value pair for every dimension. */
+function bindFilters(filters: readonly AnalyticsFilter[]): Record<string, QueryParameterValue> {
+  const bound: Record<string, QueryParameterValue> = {}
+  for (const dimension of FILTER_DIMENSIONS) {
+    const values = filterValuesFor(filters, dimension)
+    bound[`f_${dimension}_on`] = values.length > 0 ? 1 : 0
+    bound[`f_${dimension}`] = JSON.stringify(values)
+  }
+  return bound
+}
+
+/** The instant the session subquery opens at: `from` minus the session cap. */
+function sessionWindowStart(from: string): string {
+  return toClickHouseInstant(new Date(Date.parse(from) - SESSION_CAP_MS).toISOString())
+}
+
+function defineFilteredReport(definition: {
+  id: string
+  source: RollupResolution
+  alignment: RangeAlignment
+  dimensions: readonly string[]
+  orderBy: string
+  summary: string
+}): QueryOperation {
+  const selectList = [
+    ...definition.dimensions.map((column) => `  er.${column} AS ${column},`),
+    '  count() AS views,',
+    `  uniqExact(${FILTERED_VISITOR_EXPR}) AS visitors`,
+  ]
+  const sql = [
+    'SELECT',
+    ...selectList,
+    filteredEventFilter(true),
+    `GROUP BY ${definition.dimensions.join(', ')}`,
+    `ORDER BY ${definition.orderBy} DESC`,
+    'LIMIT {limit:UInt32}',
+  ].join('\n')
+
+  return defineOperation({
+    id: definition.id,
+    summary: definition.summary,
+    requiresSiteScope: true,
+    allowRawEvents: true,
+    params: filteredParamsSchema({
+      maxRangeMs: Math.min(maxRangeFor[definition.source], FILTERED_MAX_SPAN_MS),
+      alignment: definition.alignment,
+      withTimezone: false,
+      withLimit: true,
+    }),
+    sql,
+    maxRows: FILTERED_TOP_N_MAX,
+    bind: (params: Record<string, unknown>) => ({
+      site_id: params['site_id'] as string,
+      from: toClickHouseInstant(params['from'] as string),
+      to: toClickHouseInstant(params['to'] as string),
+      session_from: sessionWindowStart(params['from'] as string),
+      limit: params['limit'] as number,
+      ...bindFilters(params['filters'] as readonly AnalyticsFilter[]),
+    }),
+  })
+}
+
+const FILTERED_REPORT_SHAPES: readonly {
+  slug: string
+  dimensions: readonly string[]
+  summary: string
+}[] = [
+  { slug: 'pages', dimensions: ['page_path'], summary: 'Top pages' },
+  {
+    slug: 'sources',
+    dimensions: ['referrer_domain', 'utm_source', 'utm_medium', 'utm_campaign'],
+    summary: 'Top acquisition sources',
+  },
+  { slug: 'geography', dimensions: ['country', 'city'], summary: 'Top countries and cities' },
+  {
+    slug: 'devices',
+    dimensions: ['device_type', 'browser', 'os'],
+    summary: 'Top device/browser/OS combinations',
+  },
+]
+
+const filteredReportOperations: readonly QueryOperation[] = FILTERED_REPORT_SHAPES.flatMap(
+  (shape) => [
+    defineFilteredReport({
+      id: `analytics.filtered_${shape.slug}_hour`,
+      source: '15m',
+      alignment: 'quarter',
+      dimensions: shape.dimensions,
+      orderBy: 'views',
+      summary: `${shape.summary} for sessions matching a filter set. Quarter-hour-aligned.`,
+    }),
+    defineFilteredReport({
+      id: `analytics.filtered_${shape.slug}_day`,
+      source: '1d',
+      alignment: 'day',
+      dimensions: shape.dimensions,
+      orderBy: 'views',
+      summary: `${shape.summary} for sessions matching a filter set. UTC-day-aligned.`,
+    }),
+  ],
+)
+
+function defineFilteredOverview(definition: {
+  id: string
+  source: RollupResolution
+  alignment: RangeAlignment
+  summary: string
+}): QueryOperation {
+  const sql = [
+    'SELECT',
+    '  count() AS events,',
+    "  countIf(er.type = 'page_view') AS pageviews,",
+    '  countIf(er.billable = 1) AS billable_events,',
+    // The `OverviewTotals.visitors` contract sentence (ADR-0036): the range's
+    // visitors are the distinct identities with at least one page view in it,
+    // the population `pageviews` counts. Same rule as the rollup's
+    // `uniqMergeIf(t.visitors, t.event_type = 'page_view')`.
+    `  uniqExactIf(${FILTERED_VISITOR_EXPR}, er.type = 'page_view') AS visitors`,
+    filteredEventFilter(false),
+  ].join('\n')
+
+  return defineOperation({
+    id: definition.id,
+    summary: definition.summary,
+    requiresSiteScope: true,
+    allowRawEvents: true,
+    params: filteredParamsSchema({
+      maxRangeMs: Math.min(maxRangeFor[definition.source], FILTERED_MAX_SPAN_MS),
+      alignment: definition.alignment,
+      withTimezone: false,
+      withLimit: false,
+    }),
+    sql,
+    maxRows: 1,
+    bind: (params: Record<string, unknown>) => ({
+      site_id: params['site_id'] as string,
+      from: toClickHouseInstant(params['from'] as string),
+      to: toClickHouseInstant(params['to'] as string),
+      session_from: sessionWindowStart(params['from'] as string),
+      ...bindFilters(params['filters'] as readonly AnalyticsFilter[]),
+    }),
+  })
+}
+
+function defineFilteredTimeseries(definition: {
+  id: string
+  source: RollupResolution
+  bucketExpr: string
+  alignment: RangeAlignment
+  withTimezone: boolean
+  maxRows: number
+  summary: string
+}): QueryOperation {
+  const sql = [
+    'SELECT',
+    `  ${definition.bucketExpr} AS bucket,`,
+    '  count() AS events,',
+    "  countIf(er.type = 'page_view') AS pageviews,",
+    `  uniqExactIf(${FILTERED_VISITOR_EXPR}, er.type = 'page_view') AS visitors`,
+    filteredEventFilter(false),
+    'GROUP BY bucket',
+    'ORDER BY bucket',
+  ].join('\n')
+
+  return defineOperation({
+    id: definition.id,
+    summary: definition.summary,
+    requiresSiteScope: true,
+    allowRawEvents: true,
+    params: filteredParamsSchema({
+      maxRangeMs: Math.min(maxRangeFor[definition.source], FILTERED_MAX_SPAN_MS),
+      alignment: definition.alignment,
+      withTimezone: definition.withTimezone,
+      withLimit: false,
+    }),
+    sql,
+    maxRows: definition.maxRows,
+    bind: (params: Record<string, unknown>) => ({
+      site_id: params['site_id'] as string,
+      from: toClickHouseInstant(params['from'] as string),
+      to: toClickHouseInstant(params['to'] as string),
+      session_from: sessionWindowStart(params['from'] as string),
+      ...(definition.withTimezone ? { tz: params['timezone'] as string } : {}),
+      ...bindFilters(params['filters'] as readonly AnalyticsFilter[]),
+    }),
+  })
+}
+
+/**
+ * The filtered chart, one operation per grain, named to mirror the unfiltered
+ * family exactly so the api's grain decision is the same decision on both paths.
+ *
+ * Read straight off `occurred_at` rather than off a stored bucket, so the
+ * timezone-local grouping is done once here instead of being composed from hour
+ * buckets — which also means the UTC-day variants exist only to keep the naming
+ * parallel, and are byte-identical in shape to the local ones with `'UTC'`
+ * bound in place of the zone.
+ */
+const filteredTimeseriesOperations: readonly QueryOperation[] = [
+  defineFilteredTimeseries({
+    id: 'analytics.filtered_timeseries_minute',
+    source: '1m',
+    bucketExpr: bucketUtc('toStartOfMinute(er.occurred_at, {tz:String})'),
+    alignment: 'minute',
+    withTimezone: true,
+    maxRows: 3_000,
+    summary: 'Filtered events, pageviews and visitors per timezone-local minute.',
+  }),
+  defineFilteredTimeseries({
+    id: 'analytics.filtered_timeseries_hour',
+    source: '15m',
+    bucketExpr: bucketUtc('toStartOfHour(er.occurred_at, {tz:String})'),
+    alignment: 'quarter',
+    withTimezone: true,
+    maxRows: 1_000,
+    summary: 'Filtered events, pageviews and visitors per timezone-local hour.',
+  }),
+  defineFilteredTimeseries({
+    id: 'analytics.filtered_timeseries_day',
+    source: '15m',
+    bucketExpr: bucketUtc('toStartOfDay(er.occurred_at, {tz:String})'),
+    alignment: 'quarter',
+    withTimezone: true,
+    maxRows: 500,
+    summary: 'Filtered events, pageviews and visitors per timezone-local day.',
+  }),
+  defineFilteredTimeseries({
+    id: 'analytics.filtered_timeseries_day_utc',
+    source: '1d',
+    bucketExpr: bucketUtc('toStartOfDay(er.occurred_at)'),
+    alignment: 'day',
+    withTimezone: false,
+    maxRows: 500,
+    summary: 'Filtered events, pageviews and visitors per UTC day.',
+  }),
+  defineFilteredTimeseries({
+    id: 'analytics.filtered_timeseries_week',
+    source: '15m',
+    bucketExpr: bucketUtc('toDateTime(toStartOfWeek(er.occurred_at, 1, {tz:String}), {tz:String})'),
+    alignment: 'quarter',
+    withTimezone: true,
+    maxRows: 600,
+    summary: 'Filtered events, pageviews and visitors per timezone-local ISO week.',
+  }),
+  defineFilteredTimeseries({
+    id: 'analytics.filtered_timeseries_week_utc',
+    source: '1d',
+    bucketExpr: "toDateTime64(toStartOfWeek(er.occurred_at, 1), 3, 'UTC')",
+    alignment: 'day',
+    withTimezone: false,
+    maxRows: 600,
+    summary: 'Filtered events, pageviews and visitors per ISO week in UTC.',
+  }),
+]
+
+const filteredOverviewOperations: readonly QueryOperation[] = [
+  defineFilteredOverview({
+    id: 'analytics.filtered_overview_hour',
+    source: '15m',
+    alignment: 'quarter',
+    summary:
+      'Filtered range totals — events, pageviews, billable events, visitors. Quarter-hour-aligned.',
+  }),
+  defineFilteredOverview({
+    id: 'analytics.filtered_overview_day',
+    source: '1d',
+    alignment: 'day',
+    summary: 'Filtered range totals. UTC-day-aligned.',
+  }),
+]
+
+/**
+ * The filtered twin of the entry/exit decoration.
+ *
+ * It exists so a filtered pages screen is coherent rather than half-filtered:
+ * without it the `views` column would answer "for the filtered sessions" while
+ * the `entrances` beside it answered "for all of them", on one row, with nothing
+ * to tell them apart. Two numbers in one table that quietly mean different
+ * things is the failure mode this whole family is built to avoid.
+ */
+const filteredPageSessionOperations: readonly QueryOperation[] = [
+  definePageSessions({
+    id: 'analytics.filtered_page_sessions_hour',
+    source: '15m',
+    alignment: 'quarter',
+    filtered: true,
+    summary:
+      'Entrances, exits, bounces and sessions per page path for sessions matching a filter set. Quarter-hour-aligned.',
+  }),
+  definePageSessions({
+    id: 'analytics.filtered_page_sessions_day',
+    source: '1d',
+    alignment: 'day',
+    filtered: true,
+    summary:
+      'Entrances, exits, bounces and sessions per page path for sessions matching a filter set. UTC-day-aligned.',
+  }),
+]
+
+const filteredOperations: readonly QueryOperation[] = [
+  ...filteredOverviewOperations,
+  ...filteredTimeseriesOperations,
+  ...filteredReportOperations,
+  ...filteredPageSessionOperations,
+]
+
 const OPERATIONS: readonly QueryOperation[] = [
   clickhouseRoundtripOperation,
   ...timeseriesOperations,
@@ -2591,9 +3582,12 @@ const OPERATIONS: readonly QueryOperation[] = [
   ...customEventSampleOperations,
   ...importedReportOperations,
   ...sessionOperations,
+  ...pageSessionOperations,
   ...funnelOperations,
   ...recentVisitorOperations,
+  ...filteredOperations,
   ...revenueOperations,
+  ...siteCardOperations,
   freshnessOperation,
 ]
 

@@ -31,7 +31,7 @@ import type { SessionizerEvent } from '@openanalytics/domain'
  */
 
 export const SESSION_FACTS_TABLE = 'session_facts_versions'
-export const SESSION_ROLLUP_1H_TABLE = 'session_rollups_1h'
+export const SESSION_ROLLUP_15M_TABLE = 'session_rollups_15m'
 export const SESSION_ROLLUP_1D_TABLE = 'session_rollups_1d'
 
 /** A `session_facts_versions` row (migration 0013). */
@@ -43,6 +43,8 @@ export interface SessionFactRow {
   readonly user_id: string
   readonly anonymous_id: string
   readonly session_hint: string
+  /** Every hint the session carried (migration 0023). `[]` before the ALTER. */
+  readonly session_hints: readonly string[]
   readonly midnight_bridged: number
   readonly session_start: string
   readonly session_end: string
@@ -64,12 +66,14 @@ export interface SessionFactRow {
   readonly browser: string
   readonly os: string
   readonly country: string
+  /** ADR-0075 lane 0 / migration 0023. Empty for a session finalized before it. */
+  readonly city: string
   readonly finalized: number
   readonly retracted: number
   readonly computed_at: string
 }
 
-/** A `session_rollups_1h`/`_1d` row (migration 0014). */
+/** A `session_rollups_15m`/`_1d` row (migrations 0014 and 0026). */
 export interface SessionRollupRow {
   readonly site_id: string
   readonly bucket_start: string
@@ -93,6 +97,7 @@ export interface StoredSessionFact {
   readonly userId: string
   readonly anonymousId: string
   readonly sessionHint: string
+  readonly sessionHints: readonly string[]
   readonly midnightBridged: number
   readonly pageviews: number
   readonly engaged: number
@@ -110,6 +115,7 @@ export interface StoredSessionFact {
   readonly browser: string
   readonly os: string
   readonly country: string
+  readonly city: string
   readonly finalized: number
   readonly retracted: number
 }
@@ -133,7 +139,15 @@ export interface StoredRollupBucket extends RollupBucketAggregate {
   readonly generation: number
 }
 
-export type SessionRollupUnit = '1h' | '1d'
+/**
+ * The grains the finalizer writes.
+ *
+ * `'1h'` left this union in ADR-0079 step 4: the hour views were dropped
+ * (migration 0027) and the finalizer stopped writing `session_rollups_1h`.
+ * The table itself was dropped by migration 0029 (v0.8.0), once the 15m
+ * backfill's equality gate stopped reading it.
+ */
+export type SessionRollupUnit = '15m' | '1d'
 
 export interface SessionFactsStoreOptions {
   readonly url: string
@@ -143,11 +157,36 @@ export interface SessionFactsStoreOptions {
   readonly requestTimeoutMs?: number
   /** Overridable for tests that migrate into a throwaway database. */
   readonly factsTable?: string
-  readonly rollup1hTable?: string
+  readonly rollup15mTable?: string
   readonly rollup1dTable?: string
 }
 
 export const DEFAULT_SESSION_REQUEST_TIMEOUT_MS = 60_000
+
+/**
+ * One capped page of a recompute window.
+ *
+ * `readWindowEvents` returns this rather than a bare array because the caller
+ * has to know whether the window it asked for was DELIVERED IN FULL. It is not
+ * a pagination convenience: the session finalizer treats "everything up to
+ * `toMs`" as ground truth and writes a retraction tombstone for every stored
+ * session it does not find in that answer. Handed a silently truncated array,
+ * it would delete the sessions in the tail.
+ */
+export interface WindowEventsPage {
+  readonly events: SessionizerEvent[]
+  /**
+   * The row cap was reached, so the window is cut short and the caller must
+   * narrow its upper bound before drawing any conclusion from what is missing.
+   *
+   * Computed from the RAW row count, before the `event_id` dedup below —
+   * deduplication can shrink the array under the limit, and a caller testing
+   * `events.length === limit` would then read a truncated page as complete.
+   */
+  readonly truncated: boolean
+  /** `occurred_at` of the last row read, or null when the page is empty. */
+  readonly lastOccurredMs: number | null
+}
 
 export interface SessionFactsStore {
   /**
@@ -161,9 +200,27 @@ export interface SessionFactsStore {
    * duplicated pageview from being double-counted — the idempotent-read half of
    * acceptance criterion 3.
    */
-  readWindowEvents(input: { siteId: string; fromMs: number }): Promise<SessionizerEvent[]>
-  /** Latest version per session with `session_start >= fromMs`, tombstones included. */
-  readStoredFacts(input: { siteId: string; fromMs: number }): Promise<StoredSessionFact[]>
+  readWindowEvents(input: {
+    siteId: string
+    fromMs: number
+    /** Exclusive upper bound. Required: an unbounded read is what caused the OOM. */
+    toMs: number
+    /** Row cap. Omitted means uncapped, which only tests should ever want. */
+    limit?: number
+  }): Promise<WindowEventsPage>
+  /**
+   * Latest version per session with `session_start` in `[fromMs, toMs)`,
+   * tombstones included.
+   *
+   * `toMs` is not an optimisation. It has to be the SAME bound the events were
+   * read with, or the finalizer compares a short window of recomputed sessions
+   * against a long window of stored ones and retracts the difference.
+   */
+  readStoredFacts(input: {
+    siteId: string
+    fromMs: number
+    toMs: number
+  }): Promise<StoredSessionFact[]>
   /** Insert fact versions/tombstones under a stable content token. */
   insertFactVersions(rows: readonly SessionFactRow[]): Promise<void>
   /** Recompute the rollup buckets intersecting `[loMs, hiMs)` from current facts. */
@@ -194,8 +251,19 @@ export interface SessionFactsStore {
   close(): Promise<void>
 }
 
-/** The ordered set of `argMax(col, version)` projections that read a fact's current value. */
-const FACT_ARGMAX_COLUMNS = `
+/**
+ * The ordered set of `argMax(col, version)` projections that read a fact's
+ * current value.
+ *
+ * **Exported so a test can walk it**, which is not decoration. A column added to
+ * the table and to `StoredSessionFact` but forgotten HERE reads back as
+ * `undefined`, and the finalizer's fingerprint then compares `'' !== undefined`
+ * on every run — so every session in the window is re-versioned forever, a write
+ * loop that only a live-ClickHouse test can observe. It happened once, to `city`,
+ * during ADR-0075. `tests/unit/session-read.test.ts` now fails in milliseconds
+ * instead.
+ */
+export const FACT_ARGMAX_COLUMNS = `
   max(sfv.version)                                            AS version,
   toUnixTimestamp64Milli(argMax(sfv.session_start, sfv.version)) AS start_ms,
   toUnixTimestamp64Milli(argMax(sfv.session_end, sfv.version))   AS end_ms,
@@ -203,6 +271,7 @@ const FACT_ARGMAX_COLUMNS = `
   argMax(sfv.user_id, sfv.version)                           AS user_id,
   argMax(sfv.anonymous_id, sfv.version)                      AS anonymous_id,
   argMax(sfv.session_hint, sfv.version)                      AS session_hint,
+  argMax(sfv.session_hints, sfv.version)                     AS session_hints,
   argMax(sfv.midnight_bridged, sfv.version)                  AS midnight_bridged,
   argMax(sfv.pageviews, sfv.version)                         AS pageviews,
   argMax(sfv.engaged, sfv.version)                           AS engaged,
@@ -220,6 +289,7 @@ const FACT_ARGMAX_COLUMNS = `
   argMax(sfv.browser, sfv.version)                           AS browser,
   argMax(sfv.os, sfv.version)                                AS os,
   argMax(sfv.country, sfv.version)                           AS country,
+  argMax(sfv.city, sfv.version)                              AS city,
   argMax(sfv.finalized, sfv.version)                         AS finalized,
   argMax(sfv.retracted, sfv.version)                         AS retracted
 `
@@ -232,15 +302,37 @@ function tokenFor(namespace: string, rows: readonly object[]): string {
   return hash.digest('hex').slice(0, 32)
 }
 
-const bucketFn = (unit: SessionRollupUnit): string =>
-  unit === '1h' ? 'toStartOfHour' : 'toStartOfDay'
+/**
+ * The ClickHouse bucket function per unit.
+ *
+ * A total `Record` rather than a ternary chain, and that is not style. The
+ * `unit === '1h' ? toStartOfHour : toStartOfDay` this replaced had no case for
+ * a third unit: adding `'15m'` to `SessionRollupUnit` would have made every
+ * fifteen-minute aggregate silently bucket by DAY and write day totals into
+ * `session_rollups_15m`, with no type error and no failing query. A `Record`
+ * keyed by the union makes the omission a compile error instead
+ * (`tests/unit/session-rollup-units.test.ts` pins the mapping).
+ *
+ * The union is two units again since step 4 retired the hour grain, and the
+ * `Record` earns its keep in the other direction now: a stale `'1h'` entry left
+ * behind by that removal would also be a compile error.
+ */
+export const SESSION_ROLLUP_BUCKET_FN: Readonly<Record<SessionRollupUnit, string>> = {
+  '15m': 'toStartOfFifteenMinutes',
+  '1d': 'toStartOfDay',
+}
+
+const bucketFn = (unit: SessionRollupUnit): string => SESSION_ROLLUP_BUCKET_FN[unit]
 
 export function createSessionFactsStore(options: SessionFactsStoreOptions): SessionFactsStore {
   const factsTable = options.factsTable ?? SESSION_FACTS_TABLE
-  const rollupTable = (unit: SessionRollupUnit): string =>
-    unit === '1h'
-      ? (options.rollup1hTable ?? SESSION_ROLLUP_1H_TABLE)
-      : (options.rollup1dTable ?? SESSION_ROLLUP_1D_TABLE)
+  // Total over the unit union for the same reason `BUCKET_FN` is: a missing
+  // case here would have routed 15m rows into the day table.
+  const rollupTables: Readonly<Record<SessionRollupUnit, string>> = {
+    '15m': options.rollup15mTable ?? SESSION_ROLLUP_15M_TABLE,
+    '1d': options.rollup1dTable ?? SESSION_ROLLUP_1D_TABLE,
+  }
+  const rollupTable = (unit: SessionRollupUnit): string => rollupTables[unit]
 
   const client: ClickHouseClient = createClient({
     url: options.url,
@@ -268,7 +360,7 @@ export function createSessionFactsStore(options: SessionFactsStoreOptions): Sess
   }
 
   return {
-    async readWindowEvents({ siteId, fromMs }): Promise<SessionizerEvent[]> {
+    async readWindowEvents({ siteId, fromMs, toMs, limit }): Promise<WindowEventsPage> {
       const rows = await query<{
         event_id: string
         type: string
@@ -287,6 +379,7 @@ export function createSessionFactsStore(options: SessionFactsStoreOptions): Sess
         browser: string
         os: string
         country: string
+        city: string
         active_ms: string
       }>(
         `SELECT
@@ -307,12 +400,15 @@ export function createSessionFactsStore(options: SessionFactsStoreOptions): Sess
            browser,
            os,
            country,
+           city,
            JSONExtractInt(properties, 'oa_active_ms') AS active_ms
          FROM events_raw
          WHERE site_id = {siteId:String}
            AND occurred_at >= fromUnixTimestamp64Milli({fromMs:Int64})
-         ORDER BY occurred_at, event_id`,
-        { siteId, fromMs },
+           AND occurred_at < fromUnixTimestamp64Milli({toMs:Int64})
+         ORDER BY occurred_at, event_id
+         ${limit === undefined ? '' : 'LIMIT {limit:UInt64}'}`,
+        { siteId, fromMs, toMs, ...(limit === undefined ? {} : { limit }) },
       )
 
       const seen = new Set<string>()
@@ -339,22 +435,31 @@ export function createSessionFactsStore(options: SessionFactsStoreOptions): Sess
           browser: row.browser,
           os: row.os,
           country: row.country,
+          city: row.city,
           engagement: row.type === 'engagement' ? { activeMs, visibleMs: 0 } : null,
         })
       }
-      return events
+      // `rows`, not `events`: the dedup above can drop the row that proves the
+      // page was cut short. See `WindowEventsPage.truncated`.
+      const lastRow = rows[rows.length - 1]
+      return {
+        events,
+        truncated: limit !== undefined && rows.length >= limit,
+        lastOccurredMs: lastRow === undefined ? null : Number(lastRow.occurred_ms),
+      }
     },
 
-    async readStoredFacts({ siteId, fromMs }): Promise<StoredSessionFact[]> {
-      const rows = await query<Record<string, string>>(
+    async readStoredFacts({ siteId, fromMs, toMs }): Promise<StoredSessionFact[]> {
+      const rows = await query<Record<string, string | string[]>>(
         `SELECT
            sfv.session_id AS session_id,
            ${FACT_ARGMAX_COLUMNS}
          FROM ${factsTable} AS sfv
          WHERE sfv.site_id = {siteId:String}
            AND sfv.session_start >= fromUnixTimestamp64Milli({fromMs:Int64})
+           AND sfv.session_start < fromUnixTimestamp64Milli({toMs:Int64})
          GROUP BY sfv.site_id, sfv.session_id`,
-        { siteId, fromMs },
+        { siteId, fromMs, toMs },
       )
 
       return rows.map((row) => ({
@@ -366,6 +471,9 @@ export function createSessionFactsStore(options: SessionFactsStoreOptions): Sess
         userId: row['user_id'] as string,
         anonymousId: row['anonymous_id'] as string,
         sessionHint: row['session_hint'] as string,
+        // `Array(String)` comes back as a JSON array. A pre-0023 part reads back
+        // as `[]`, which is the honest "this row predates the column".
+        sessionHints: Array.isArray(row['session_hints']) ? row['session_hints'] : [],
         midnightBridged: Number(row['midnight_bridged']),
         pageviews: Number(row['pageviews']),
         engaged: Number(row['engaged']),
@@ -383,6 +491,7 @@ export function createSessionFactsStore(options: SessionFactsStoreOptions): Sess
         browser: row['browser'] as string,
         os: row['os'] as string,
         country: row['country'] as string,
+        city: row['city'] as string,
         finalized: Number(row['finalized']),
         retracted: Number(row['retracted']),
       }))

@@ -62,6 +62,15 @@ export const api = new OpenAnalyticsClient({
 
 export type Schemas = components["schemas"];
 export type SiteSummary = Schemas["SiteSummary"];
+/**
+ * A row of `GET /v1/sites`: the summary plus the card figures (ADR-0080).
+ *
+ * `all_time`/`sparkline` are `null` when the figures could not be computed for
+ * that response — never the same thing as zero, which is a real measurement.
+ */
+export type SiteListItem = Schemas["SiteListItem"];
+export type SiteCardTotals = Schemas["SiteCardTotals"];
+export type SiteCardRevenue = Schemas["SiteCardRevenue"];
 export type SiteRole = Schemas["SiteRole"];
 export type SiteStatus = Schemas["SiteStatus"];
 export type SiteMember = Schemas["SiteMember"];
@@ -284,7 +293,7 @@ export async function send<T>(
 /* Endpoints — one function per operation the screens use. ------------------ */
 
 export const sites = {
-  list: () => api.get<{ items: SiteSummary[] }>("/v1/sites"),
+  list: () => api.get<{ items: SiteListItem[] }>("/v1/sites"),
   resolve: (slug: string) =>
     api.get<SiteResolution>(
       `/v1/sites/resolve?slug=${encodeURIComponent(slug)}`
@@ -302,10 +311,11 @@ export const sites = {
    * replace the origin allowlist is trusted with the label the numbers are
    * denominated in, while reading those numbers stays owner-only.
    *
-   * `reporting_timezone` (ADR-0044) rides the same PATCH under the same
-   * scope. `null` clears it — "not configured; the viewer's clock applies" —
-   * and an IANA name is required: the server refuses offsets like `+05:00`
-   * with a `400`, because an offset is a timezone evaluated at one instant.
+   * `reporting_timezone` (ADR-0044, ADR-0079 D5) rides the same PATCH under the
+   * same scope, and an IANA name is the only thing it takes: the server refuses
+   * offsets like `+05:00` with a `400`, because an offset is a timezone
+   * evaluated at one instant, and it refuses `null` too — every site has a
+   * clock, and a reader who wants their own picks it from the header pill.
    */
   update: (
     siteId: string,
@@ -313,7 +323,7 @@ export const sites = {
       name?: string;
       domains?: string[];
       reporting_currency?: string;
-      reporting_timezone?: string | null;
+      reporting_timezone?: string;
     }
   ) => send<SiteSummary>("PATCH", `/v1/sites/${siteId}`, { body }),
   /**
@@ -868,10 +878,8 @@ export const widgets = {
  * - **A publish reaches an already-loaded browser in up to ~10 minutes**
  *   (HTTP cache + tracker config cache). There is no completion signal.
  *
- * Preview mints a 15-minute signed token for `?oa_preview=` on the customer's
- * own site; the events it produces are `test_mode` and touch no production
- * read. Reads are membership-only (viewer included); every mutation, preview
- * included, needs `site:settings`.
+ * Reads are membership-only (viewer included); every mutation needs
+ * `site:settings`.
  */
 export const eventDefinitions = {
   list: (siteId: string, includeArchived = false) =>
@@ -929,12 +937,6 @@ export const eventDefinitions = {
       "POST",
       `/v1/sites/${siteId}/event-definitions/${definitionId}/rollback`,
       { body }
-    ),
-  preview: (siteId: string, definitionId: string, version: number) =>
-    send<{ token: string; expires_at: string; version: number }>(
-      "POST",
-      `/v1/sites/${siteId}/event-definitions/${definitionId}/preview`,
-      { body: { version } }
     ),
 };
 
@@ -1385,18 +1387,29 @@ function analyticsGet<T>(
   );
 }
 
+/**
+ * `filters` on the six reads below is the ADR-0075 session filter, passed as
+ * the serialized JSON the chip row produced (`serializeFilters`). It is
+ * accepted on overview, timeseries, pages, sources, geography and devices,
+ * and deliberately NOT plumbed into custom events, performance or sessions,
+ * where sending one is a `400 VALIDATION_FAILED`: the absence of the option
+ * on those fetchers is the guard.
+ */
 export function getAnalyticsOverview(
   siteId: string,
   range: AnalyticsRange,
-  options?: RequestOptions & { resolution?: "hour" | "day" }
+  options?: RequestOptions & { resolution?: "hour" | "day"; filters?: string }
 ): Promise<AnalyticsOverviewResponse> {
-  const { resolution, ...rest } = options ?? {};
+  const { resolution, filters, ...rest } = options ?? {};
   return analyticsGet<AnalyticsOverviewResponse>(
     siteId,
     "overview",
     range,
     rest,
-    resolution ? { resolution } : undefined
+    {
+      ...(resolution ? { resolution } : {}),
+      ...(filters ? { filters } : {}),
+    }
   );
 }
 
@@ -1409,15 +1422,18 @@ export function getAnalyticsOverview(
 export function getAnalyticsTimeseries(
   siteId: string,
   range: AnalyticsRange,
-  options?: RequestOptions & { resolution?: Resolution }
+  options?: RequestOptions & { resolution?: Resolution; filters?: string }
 ): Promise<AnalyticsTimeseriesResponse> {
-  const { resolution, ...rest } = options ?? {};
+  const { resolution, filters, ...rest } = options ?? {};
   return analyticsGet<AnalyticsTimeseriesResponse>(
     siteId,
     "timeseries",
     range,
     rest,
-    resolution ? { resolution } : undefined
+    {
+      ...(resolution ? { resolution } : {}),
+      ...(filters ? { filters } : {}),
+    }
   );
 }
 
@@ -1465,12 +1481,25 @@ export function getAnalyticsFunnel(
   );
 }
 
+/**
+ * `sort` picks the measure the server ranks AND cuts by: `views` (default),
+ * `entrances` or `exits`. The returned page must not be re-sorted client-side:
+ * the top-N cut and the sort are one decision, and a top-100-by-views page
+ * re-sorted by exits would present that page's biggest exits as the site's
+ * biggest. A column header is therefore a request change, not an array sort.
+ */
+export type PagesSort = "views" | "entrances" | "exits";
+
 export function getAnalyticsPages(
   siteId: string,
   range: AnalyticsRange,
-  options?: RequestOptions
+  options?: RequestOptions & { filters?: string; sort?: PagesSort }
 ): Promise<AnalyticsPagesResponse> {
-  return analyticsGet<AnalyticsPagesResponse>(siteId, "pages", range, options);
+  const { filters, sort, ...rest } = options ?? {};
+  return analyticsGet<AnalyticsPagesResponse>(siteId, "pages", range, rest, {
+    ...(filters ? { filters } : {}),
+    ...(sort && sort !== "views" ? { sort } : {}),
+  });
 }
 
 /**
@@ -1521,39 +1550,45 @@ export function getVisitorTrail(
 export function getAnalyticsSources(
   siteId: string,
   range: AnalyticsRange,
-  options?: RequestOptions
+  options?: RequestOptions & { filters?: string }
 ): Promise<AnalyticsSourcesResponse> {
+  const { filters, ...rest } = options ?? {};
   return analyticsGet<AnalyticsSourcesResponse>(
     siteId,
     "sources",
     range,
-    options
+    rest,
+    filters ? { filters } : undefined
   );
 }
 
 export function getAnalyticsGeography(
   siteId: string,
   range: AnalyticsRange,
-  options?: RequestOptions
+  options?: RequestOptions & { filters?: string }
 ): Promise<AnalyticsGeographyResponse> {
+  const { filters, ...rest } = options ?? {};
   return analyticsGet<AnalyticsGeographyResponse>(
     siteId,
     "geography",
     range,
-    options
+    rest,
+    filters ? { filters } : undefined
   );
 }
 
 export function getAnalyticsDevices(
   siteId: string,
   range: AnalyticsRange,
-  options?: RequestOptions
+  options?: RequestOptions & { filters?: string }
 ): Promise<AnalyticsDevicesResponse> {
+  const { filters, ...rest } = options ?? {};
   return analyticsGet<AnalyticsDevicesResponse>(
     siteId,
     "devices",
     range,
-    options
+    rest,
+    filters ? { filters } : undefined
   );
 }
 
@@ -1643,6 +1678,7 @@ export type ErrorPresentation = {
     | "rate_limited"
     | "unavailable"
     | "range"
+    | "filtered_range"
     | "unknown";
   title: string;
   body: string;
@@ -1749,6 +1785,19 @@ const PRESENTATIONS: Record<string, Omit<ErrorPresentation, "retryable">> = {
     body: "This range and timezone cannot be served at this grain. Try a shorter range or UTC.",
   },
   /**
+   * ADR-0075: a filtered read is answered from the raw events joined to the
+   * session facts rather than from a rollup, so it covers at most 92 days
+   * while the unfiltered report still answers a year. Its own `kind` rather
+   * than `range`, because the recovery is different in kind: the filtered
+   * cards offer "last 90 days, chips kept" and "chips cleared, range kept",
+   * both of which the generic range presentation has no business offering.
+   */
+  RANGE_TOO_LARGE: {
+    kind: "filtered_range",
+    title: "Too long for a filtered view",
+    body: "A filtered view covers at most 92 days. Narrow the range, or clear the filters to see all of it.",
+  },
+  /**
    * The two revenue-connect refusals, which say opposite things about retrying
    * — which is the whole reason they are separate codes (frontend_tasks §24).
    * `PROVIDER_UNAVAILABLE` is the third of that trio and already sits below,
@@ -1796,8 +1845,24 @@ export function registerErrorPresentations(
   entries: Readonly<Record<string, Omit<ErrorPresentation, "retryable">>>
 ): void {
   for (const [code, presentation] of Object.entries(entries)) {
-    if (code in PRESENTATIONS) {
-      throw new Error(`error code ${code} already has a presentation`);
+    const existing = PRESENTATIONS[code];
+    if (existing) {
+      // Two surfaces owning one code's words would make what the user reads
+      // depend on module order, so different words still throw. An identical
+      // re-registration is deliberately not a conflict: Fast Refresh
+      // re-evaluates a registering module on every edit while this table's
+      // module may keep its state, and crashing the app for a module saying
+      // the same words twice turns every edit into a dev-server 500.
+      // Sameness is field equality, not identity, because the re-evaluated
+      // module builds a fresh object.
+      const same =
+        existing.kind === presentation.kind &&
+        existing.title === presentation.title &&
+        existing.body === presentation.body;
+      if (!same) {
+        throw new Error(`error code ${code} already has a presentation`);
+      }
+      continue;
     }
     PRESENTATIONS[code] = presentation;
   }
