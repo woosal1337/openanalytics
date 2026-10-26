@@ -197,6 +197,26 @@ services:
       CLICKHOUSE_MIGRATION_PASSWORD: ${SERVICE_PASSWORD_CHMIGRATE}
     volumes:
       - ch-data:/var/lib/clickhouse
+      # LOCAL CHANGE (chele.bi): ClickHouse keeps its own system logs forever by
+      # default, and here they reached 13 GiB against 15 MiB of analytics data.
+      # `content:` makes Coolify write the file, which a relative bind cannot.
+      # On the first start with a new TTL, ClickHouse renames each old table to
+      # `<name>_0`; drop those by hand.
+      - type: bind
+        source: ./clickhouse-system-log-ttl.xml
+        target: /etc/clickhouse-server/config.d/system-log-ttl.xml
+        content: |
+          <clickhouse>
+            <query_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></query_log>
+            <query_views_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></query_views_log>
+            <trace_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></trace_log>
+            <metric_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></metric_log>
+            <asynchronous_metric_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></asynchronous_metric_log>
+            <part_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></part_log>
+            <background_schedule_pool_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></background_schedule_pool_log>
+            <processors_profile_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></processors_profile_log>
+            <text_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></text_log>
+          </clickhouse>
     ulimits:
       nofile:
         soft: 262144
